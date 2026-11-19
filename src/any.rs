@@ -9,7 +9,7 @@ use crate::{
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
-use futures_util::{FutureExt, StreamExt, TryStreamExt};
+use futures_util::{FutureExt, StreamExt};
 use sqlx_core::any::driver::AnyDriver;
 use sqlx_core::any::{
     AnyArguments, AnyColumn, AnyConnectOptions, AnyConnectionBackend, AnyQueryResult, AnyRow,
@@ -118,17 +118,14 @@ impl AnyConnectionBackend for MssqlConnection {
             let native_arguments = arguments
                 .map(convert_any_arguments)
                 .transpose()
-                .map_err(Error::Encode)?;
-            let mut stream = self.fetch_many_sql(query, Ok(native_arguments));
-
-            while let Some(item) = stream.try_next().await? {
-                if let Either::Right(row) = item {
+                .map_err(Error::Encode);
+            self.fetch_optional_sql(query, native_arguments)
+                .await?
+                .map(|row| {
                     let column_names = column_names(row.columns());
-                    return AnyRow::map_from(&row, column_names).map(Some);
-                }
-            }
-
-            Ok(None)
+                    AnyRow::map_from(&row, column_names)
+                })
+                .transpose()
         })
     }
 

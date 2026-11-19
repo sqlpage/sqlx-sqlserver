@@ -347,6 +347,25 @@ impl MssqlConnection {
         .flatten()
         .boxed()
     }
+
+    pub(crate) async fn fetch_optional_sql(
+        &mut self,
+        sql: SqlStr,
+        arguments: Result<Option<MssqlArguments>, Error>,
+    ) -> Result<Option<MssqlRow>, Error> {
+        let mut stream = self.fetch_many_sql(sql, arguments);
+        let mut first_row = None;
+
+        // A batch may report an error or change connection state after its first row.
+        while let Some(item) = stream.try_next().await? {
+            match item {
+                Either::Right(row) if first_row.is_none() => first_row = Some(row),
+                _ => {}
+            }
+        }
+
+        Ok(first_row)
+    }
 }
 
 impl Connection for MssqlConnection {
@@ -417,24 +436,18 @@ impl<'c> Executor<'c> for &'c mut MssqlConnection {
         self.fetch_many_sql(sql, arguments)
     }
 
-    fn fetch_optional<'e, 'q, E>(self, query: E) -> BoxFuture<'e, Result<Option<MssqlRow>, Error>>
+    fn fetch_optional<'e, 'q, E>(
+        self,
+        mut query: E,
+    ) -> BoxFuture<'e, Result<Option<MssqlRow>, Error>>
     where
         'c: 'e,
         E: Execute<'q, Self::Database>,
         'q: 'e,
         E: 'q,
     {
-        let mut stream = self.fetch_many(query);
-
-        Box::pin(async move {
-            while let Some(value) = stream.try_next().await? {
-                if let Either::Right(row) = value {
-                    return Ok(Some(row));
-                }
-            }
-
-            Ok(None)
-        })
+        let arguments = query.take_arguments().map_err(Error::Encode);
+        Box::pin(self.fetch_optional_sql(query.sql(), arguments))
     }
 
     fn prepare_with<'e>(
