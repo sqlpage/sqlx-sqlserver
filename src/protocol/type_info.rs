@@ -7,6 +7,7 @@ use sqlx_core::error::BoxDynError;
 use crate::Mssql;
 
 const PLP_NULL: u64 = 0xffff_ffff_ffff_ffff;
+const PLP_UNKNOWN_LENGTH: u64 = 0xffff_ffff_ffff_fffe;
 const PLP_CHUNK_SIZE: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -398,18 +399,12 @@ impl TypeInfo {
     }
 
     pub(crate) fn get_big_blob(&self, input: &mut &[u8]) -> Result<Option<Bytes>, TypeInfoError> {
-        // Unknown size, length-prefixed blobs.
         let len = read_u64_le(input)?;
+        if len == PLP_NULL {
+            return Ok(None);
+        }
 
-        let mut data = match len {
-            // NULL
-            0xffff_ffff_ffff_ffff => return Ok(None),
-            // Unknown size
-            0xffff_ffff_ffff_fffe => Vec::new(),
-            // Known size
-            _ => Vec::with_capacity(usize::try_from(len).unwrap()),
-        };
-
+        let mut data = Vec::new();
         loop {
             let chunk_size = read_u32_le(input)? as usize;
 
@@ -418,6 +413,13 @@ impl TypeInfo {
             }
 
             data.extend_from_slice(take(input, chunk_size)?);
+        }
+
+        if len != PLP_UNKNOWN_LENGTH && len != data.len() as u64 {
+            return Err(TypeInfoError::InvalidPlpLength {
+                declared: len,
+                actual: data.len(),
+            });
         }
 
         Ok(Some(Bytes::from(data)))
@@ -846,6 +848,8 @@ pub(crate) enum TypeInfoError {
     UnsupportedDataType(DataType),
     #[error("invalid scale {scale} for type {ty:?}")]
     InvalidScale { ty: DataType, scale: u8 },
+    #[error("TDS value declared {declared} bytes but contained {actual} bytes")]
+    InvalidPlpLength { declared: u64, actual: usize },
 }
 
 fn read_u8(input: &mut &[u8]) -> Result<u8, TypeInfoError> {
@@ -966,6 +970,19 @@ mod tests {
             type_info.get_value(&payload, &mut input).unwrap()
         );
         assert!(input.is_empty());
+    }
+
+    #[test]
+    fn rejects_blob_with_mismatched_length() {
+        let type_info = TypeInfo::new(DataType::BigVarBinary, 0xffff);
+        let payload = Bytes::from_static(&[2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, b'a', 0, 0, 0, 0]);
+        assert_eq!(
+            Err(TypeInfoError::InvalidPlpLength {
+                declared: 2,
+                actual: 1,
+            }),
+            type_info.get_value(&payload, &mut payload.as_ref()),
+        );
     }
 
     #[test]

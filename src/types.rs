@@ -104,10 +104,10 @@ impl Decode<'_, Mssql> for Decimal {
                 let (sign, numerator) = decode_numeric_bytes(bytes)?;
                 let signed_numerator = i128::try_from(numerator)? * i128::from(sign);
 
-                Ok(Decimal::from_i128_with_scale(
+                Ok(Decimal::try_from_i128_with_scale(
                     signed_numerator,
                     u32::from(value.mssql_type_info().scale()),
-                ))
+                )?)
             }
             MssqlType::Money => Ok(Decimal::new(decode_money_bytes(bytes)?, 4)),
             other => Err(format!("expected SQL Server numeric type, got {other:?}").into()),
@@ -454,10 +454,11 @@ impl Encode<'_, Mssql> for time::PrimitiveDateTime {
 #[cfg(feature = "time")]
 impl Encode<'_, Mssql> for time::OffsetDateTime {
     fn encode_by_ref(&self, buf: &mut Vec<u8>) -> Result<IsNull, BoxDynError> {
-        buf.extend_from_slice(&encode_time_datetime2(time::PrimitiveDateTime::new(
-            self.date(),
-            self.time(),
-        )));
+        let utc = self
+            .checked_to_offset(time::UtcOffset::UTC)
+            .ok_or("SQL Server datetimeoffset has an out-of-range UTC date")?;
+        let datetime = time::PrimitiveDateTime::new(utc.date(), utc.time());
+        buf.extend_from_slice(&encode_time_datetime2(datetime));
         buf.extend_from_slice(&self.offset().whole_minutes().to_le_bytes());
         Ok(IsNull::No)
     }
@@ -487,11 +488,8 @@ impl Decode<'_, Mssql> for time::PrimitiveDateTime {
         match value.mssql_type_info().kind() {
             MssqlType::DateTime2 => decode_time_datetime2(value.mssql_type_info().scale(), bytes),
             MssqlType::DateTimeOffset => {
-                let naive = decode_time_datetime2(
-                    value.mssql_type_info().scale(),
-                    &bytes[..bytes.len() - 2],
-                )?;
-                Ok(naive)
+                let datetime = decode_time_datetimeoffset(value.mssql_type_info().scale(), bytes)?;
+                Ok(Self::new(datetime.date(), datetime.time()))
             }
             other => Err(format!("unsupported SQL Server datetime type {other:?}").into()),
         }
@@ -506,12 +504,7 @@ impl Decode<'_, Mssql> for time::OffsetDateTime {
             return Err("unsupported SQL Server datetimeoffset type".into());
         }
 
-        let naive =
-            decode_time_datetime2(value.mssql_type_info().scale(), &bytes[..bytes.len() - 2])?;
-        let offset_minutes = i16::from_le_bytes([bytes[bytes.len() - 2], bytes[bytes.len() - 1]]);
-        let offset = time::UtcOffset::from_whole_seconds(i32::from(offset_minutes) * 60)?;
-
-        Ok(naive.assume_offset(offset))
+        decode_time_datetimeoffset(value.mssql_type_info().scale(), bytes)
     }
 }
 
@@ -686,9 +679,75 @@ fn decode_time_time(scale: u8, data: &[u8]) -> Result<time::Time, BoxDynError> {
 
 #[cfg(feature = "time")]
 fn decode_time_datetime2(scale: u8, bytes: &[u8]) -> Result<time::PrimitiveDateTime, BoxDynError> {
-    let time_size = bytes.len() - 3;
+    let (time, date) = bytes
+        .split_last_chunk::<3>()
+        .ok_or("invalid SQL Server datetime2 length")?;
     Ok(time::PrimitiveDateTime::new(
-        decode_time_date(&bytes[time_size..])?,
-        decode_time_time(scale, &bytes[..time_size])?,
+        decode_time_date(date)?,
+        decode_time_time(scale, time)?,
     ))
+}
+
+#[cfg(feature = "time")]
+fn decode_time_datetimeoffset(
+    scale: u8,
+    bytes: &[u8],
+) -> Result<time::OffsetDateTime, BoxDynError> {
+    let (datetime, offset) = bytes
+        .split_last_chunk::<2>()
+        .ok_or("invalid SQL Server datetimeoffset length")?;
+    let offset_minutes = i16::from_le_bytes(*offset);
+    let offset = time::UtcOffset::from_whole_seconds(i32::from(offset_minutes) * 60)?;
+    decode_time_datetime2(scale, datetime)?
+        .assume_utc()
+        .checked_to_offset(offset)
+        .ok_or_else(|| "SQL Server datetimeoffset has an out-of-range local date".into())
+}
+
+#[cfg(all(test, any(feature = "decimal", feature = "time")))]
+mod tests {
+    use super::*;
+    use crate::MssqlValue;
+    use sqlx_core::value::Value;
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn rejects_sql_decimal_outside_rust_decimal_range() {
+        let mut data = vec![1];
+        data.extend_from_slice(&(10_u128.pow(38) - 1).to_le_bytes());
+        let value = MssqlValue::new(MssqlTypeInfo::DECIMAL, Some(data.into()));
+
+        assert!(Decimal::decode(value.as_ref()).is_err());
+    }
+
+    #[cfg(feature = "time")]
+    #[test]
+    fn encodes_and_decodes_datetimeoffset_with_utc_wire_date() {
+        use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
+
+        let local = PrimitiveDateTime::new(
+            Date::from_calendar_date(2016, Month::October, 23).unwrap(),
+            Time::from_hms_nano(0, 45, 37, 123_456_700).unwrap(),
+        );
+        let utc = PrimitiveDateTime::new(
+            Date::from_calendar_date(2016, Month::October, 22).unwrap(),
+            Time::from_hms_nano(22, 45, 37, 123_456_700).unwrap(),
+        );
+        let offset = UtcOffset::from_hms(2, 0, 0).unwrap();
+        let mut wire = encode_time_datetime2(utc).to_vec();
+        wire.extend_from_slice(&120_i16.to_le_bytes());
+
+        let mut encoded = Vec::new();
+        let _ = local
+            .assume_offset(offset)
+            .encode_by_ref(&mut encoded)
+            .unwrap();
+        assert_eq!(wire, encoded);
+
+        let value = MssqlValue::new(MssqlTypeInfo::DATETIMEOFFSET, Some(wire.into()));
+        let decoded = OffsetDateTime::decode(value.as_ref()).unwrap();
+        assert_eq!(utc.assume_utc(), decoded);
+        assert_eq!(offset, decoded.offset());
+        assert_eq!(local, PrimitiveDateTime::decode(value.as_ref()).unwrap());
+    }
 }
