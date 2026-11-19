@@ -1,31 +1,11 @@
-use std::fmt::Write;
-
 use bytes::Bytes;
-use sqlx_core::encode::{Encode, IsNull};
-use sqlx_core::error::BoxDynError;
-
-use crate::Mssql;
-
-const PLP_NULL: u64 = 0xffff_ffff_ffff_ffff;
-const PLP_CHUNK_SIZE: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CollationFlags(u8);
 
 impl CollationFlags {
-    pub(crate) const IGNORE_CASE: Self = Self(1 << 0);
-    pub(crate) const IGNORE_ACCENT: Self = Self(1 << 1);
-    pub(crate) const IGNORE_WIDTH: Self = Self(1 << 2);
-    pub(crate) const IGNORE_KANA: Self = Self(1 << 3);
-    pub(crate) const BINARY: Self = Self(1 << 4);
-    pub(crate) const BINARY2: Self = Self(1 << 5);
-
     pub(crate) const fn from_bits_truncate(bits: u8) -> Self {
         Self(bits & 0x3f)
-    }
-
-    pub(crate) const fn bits(self) -> u8 {
-        self.0
     }
 }
 
@@ -221,80 +201,6 @@ impl TypeInfo {
         })
     }
 
-    // writes a TYPE_INFO to the buffer
-    pub(crate) fn put(&self, out: &mut Vec<u8>) -> Result<(), BoxDynError> {
-        out.push(self.ty as u8);
-
-        match self.ty {
-            DataType::Null
-            | DataType::TinyInt
-            | DataType::Bit
-            | DataType::SmallInt
-            | DataType::Int
-            | DataType::SmallDateTime
-            | DataType::Real
-            | DataType::SmallMoney
-            | DataType::BigInt
-            | DataType::Money
-            | DataType::DateTime
-            | DataType::Float => {}
-
-            DataType::TimeN | DataType::DateTime2N | DataType::DateTimeOffsetN => {
-                out.push(self.scale);
-            }
-
-            DataType::Guid
-            | DataType::IntN
-            | DataType::BitN
-            | DataType::FloatN
-            | DataType::MoneyN
-            | DataType::DateTimeN
-            | DataType::DateN
-            | DataType::Char
-            | DataType::VarChar
-            | DataType::Binary
-            | DataType::VarBinary => {
-                out.push(u8::try_from(self.size)?);
-            }
-
-            DataType::Decimal | DataType::Numeric | DataType::DecimalN | DataType::NumericN => {
-                out.push(u8::try_from(self.size)?);
-                out.push(self.precision);
-                out.push(self.scale);
-            }
-
-            DataType::BigVarBinary | DataType::BigBinary => {
-                out.extend_from_slice(&u16::try_from(self.size)?.to_le_bytes());
-            }
-
-            DataType::BigVarChar | DataType::BigChar | DataType::NVarChar | DataType::NChar => {
-                out.extend_from_slice(&u16::try_from(self.size)?.to_le_bytes());
-
-                if let Some(collation) = &self.collation {
-                    collation.put(out);
-                } else {
-                    out.extend_from_slice(&0_u32.to_le_bytes());
-                    out.push(0);
-                }
-            }
-
-            DataType::Xml
-            | DataType::UserDefined
-            | DataType::Text
-            | DataType::Image
-            | DataType::NText
-            | DataType::Variant => {
-                log::error!("Unsupported mssql data type argument writing {:?}", self.ty);
-            }
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn is_null(&self) -> bool {
-        matches!(self.ty, DataType::Null)
-    }
-
     pub(crate) fn is_nullable_or_variable_length(&self) -> bool {
         !matches!(
             self.ty,
@@ -423,156 +329,6 @@ impl TypeInfo {
         Ok(Some(Bytes::from(data)))
     }
 
-    pub(crate) fn put_value<'q, T: Encode<'q, Mssql>>(
-        &self,
-        out: &mut Vec<u8>,
-        value: T,
-    ) -> Result<(), BoxDynError> {
-        match self.ty {
-            DataType::Null
-            | DataType::TinyInt
-            | DataType::Bit
-            | DataType::SmallInt
-            | DataType::Int
-            | DataType::SmallDateTime
-            | DataType::Real
-            | DataType::Money
-            | DataType::DateTime
-            | DataType::DateN
-            | DataType::Float
-            | DataType::SmallMoney
-            | DataType::BigInt => {
-                self.put_fixed_value(out, value)?;
-            }
-
-            DataType::Guid
-            | DataType::IntN
-            | DataType::Decimal
-            | DataType::Numeric
-            | DataType::BitN
-            | DataType::DecimalN
-            | DataType::NumericN
-            | DataType::FloatN
-            | DataType::MoneyN
-            | DataType::DateTimeN
-            | DataType::TimeN
-            | DataType::DateTime2N
-            | DataType::DateTimeOffsetN
-            | DataType::Char
-            | DataType::VarChar
-            | DataType::Binary
-            | DataType::VarBinary => {
-                self.put_byte_len_value(out, value)?;
-            }
-
-            DataType::BigVarBinary
-            | DataType::BigVarChar
-            | DataType::BigBinary
-            | DataType::BigChar
-            | DataType::NVarChar
-            | DataType::NChar
-            | DataType::Xml
-            | DataType::UserDefined => {
-                if self.size == 0xffff {
-                    self.put_big_blob(out, value)?;
-                } else {
-                    self.put_short_len_value(out, value)?;
-                }
-            }
-
-            DataType::Text | DataType::Image | DataType::NText | DataType::Variant => {
-                self.put_long_len_value(out, value)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn put_fixed_value<'q, T: Encode<'q, Mssql>>(
-        &self,
-        out: &mut Vec<u8>,
-        value: T,
-    ) -> Result<(), BoxDynError> {
-        let _ = value.encode(out)?;
-        Ok(())
-    }
-
-    pub(crate) fn put_byte_len_value<'q, T: Encode<'q, Mssql>>(
-        &self,
-        out: &mut Vec<u8>,
-        value: T,
-    ) -> Result<(), BoxDynError> {
-        let offset = out.len();
-        out.push(0);
-
-        let size = if let IsNull::Yes = value.encode(out)? {
-            0xff
-        } else {
-            u8::try_from(out.len() - offset - 1)?
-        };
-
-        out[offset] = size;
-        Ok(())
-    }
-
-    pub(crate) fn put_short_len_value<'q, T: Encode<'q, Mssql>>(
-        &self,
-        out: &mut Vec<u8>,
-        value: T,
-    ) -> Result<(), BoxDynError> {
-        let offset = out.len();
-        out.extend_from_slice(&0_u16.to_le_bytes());
-
-        let size = if let IsNull::Yes = value.encode(out)? {
-            0xffff
-        } else {
-            u16::try_from(out.len() - offset - 2)?
-        };
-
-        out[offset..(offset + 2)].copy_from_slice(&size.to_le_bytes());
-        Ok(())
-    }
-
-    pub(crate) fn put_big_blob<'q, T: Encode<'q, Mssql>>(
-        &self,
-        out: &mut Vec<u8>,
-        value: T,
-    ) -> Result<(), BoxDynError> {
-        let mut value_buf = Vec::new();
-        if let IsNull::Yes = value.encode(&mut value_buf)? {
-            out.extend_from_slice(&PLP_NULL.to_le_bytes());
-            return Ok(());
-        }
-
-        out.extend_from_slice(&u64::try_from(value_buf.len())?.to_le_bytes());
-
-        for chunk in value_buf.chunks(PLP_CHUNK_SIZE) {
-            out.extend_from_slice(&u32::try_from(chunk.len())?.to_le_bytes());
-            out.extend_from_slice(chunk);
-        }
-
-        out.extend_from_slice(&0_u32.to_le_bytes());
-        Ok(())
-    }
-
-    pub(crate) fn put_long_len_value<'q, T: Encode<'q, Mssql>>(
-        &self,
-        out: &mut Vec<u8>,
-        value: T,
-    ) -> Result<(), BoxDynError> {
-        let offset = out.len();
-        out.extend_from_slice(&0_u32.to_le_bytes());
-
-        let size = if let IsNull::Yes = value.encode(out)? {
-            0xffff_ffff
-        } else {
-            u32::try_from(out.len() - offset - 4)?
-        };
-
-        out[offset..(offset + 4)].copy_from_slice(&size.to_le_bytes());
-        Ok(())
-    }
-
     pub(crate) fn name(&self) -> &'static str {
         match self.ty {
             DataType::Null => "NULL",
@@ -631,119 +387,6 @@ impl TypeInfo {
             DataType::Image => "IMAGE",
             DataType::NText => "NTEXT",
             DataType::Variant => "SQL_VARIANT",
-        }
-    }
-
-    pub(crate) fn fmt(&self, out: &mut String) {
-        match self.ty {
-            DataType::Null => out.push_str("nvarchar(1)"),
-            DataType::TinyInt => out.push_str("tinyint"),
-            DataType::SmallInt => out.push_str("smallint"),
-            DataType::Int => out.push_str("int"),
-            DataType::BigInt => out.push_str("bigint"),
-            DataType::Real => out.push_str("real"),
-            DataType::Float => out.push_str("float"),
-            DataType::Bit => out.push_str("bit"),
-
-            DataType::IntN => out.push_str(match self.size {
-                1 => "tinyint",
-                2 => "smallint",
-                4 => "int",
-                8 => "bigint",
-                n => unreachable!("invalid size {} for int", n),
-            }),
-
-            DataType::FloatN => out.push_str(match self.size {
-                4 => "real",
-                8 => "float",
-                n => unreachable!("invalid size {} for float", n),
-            }),
-
-            DataType::NVarChar | DataType::NChar => {
-                out.push_str(match self.ty {
-                    DataType::NVarChar => "nvarchar",
-                    DataType::NChar => "nchar",
-                    _ => unreachable!(),
-                });
-
-                if self.size == 0xffff {
-                    out.push_str("(max)");
-                } else {
-                    let _ = write!(out, "({})", self.size / 2);
-                }
-            }
-
-            DataType::VarChar
-            | DataType::BigVarChar
-            | DataType::Char
-            | DataType::BigChar
-            | DataType::VarBinary
-            | DataType::BigVarBinary
-            | DataType::Binary
-            | DataType::BigBinary => {
-                out.push_str(match self.ty {
-                    DataType::VarChar => "varchar",
-                    DataType::BigVarChar => "bigvarchar",
-                    DataType::Char => "char",
-                    DataType::BigChar => "bigchar",
-                    DataType::VarBinary => "varbinary",
-                    DataType::BigVarBinary => "varbinary",
-                    DataType::Binary => "binary",
-                    DataType::BigBinary => "binary",
-                    _ => unreachable!(),
-                });
-
-                if self.size == 0xffff {
-                    out.push_str("(max)");
-                } else {
-                    let _ = write!(out, "({})", self.size);
-                }
-            }
-
-            DataType::BitN => {
-                out.push_str("bit");
-            }
-
-            DataType::DateN => {
-                out.push_str("date");
-            }
-
-            DataType::DateTime | DataType::DateTimeN => {
-                out.push_str("datetime");
-            }
-
-            DataType::DateTime2N => {
-                let _ = write!(out, "datetime2({})", self.scale);
-            }
-
-            DataType::DateTimeOffsetN => {
-                let _ = write!(out, "datetimeoffset({})", self.scale);
-            }
-
-            DataType::TimeN => {
-                let _ = write!(out, "time({})", self.scale);
-            }
-            DataType::SmallDateTime => out.push_str("smalldatetime"),
-            DataType::Money => out.push_str("money"),
-            DataType::SmallMoney => out.push_str("smallmoney"),
-            DataType::Guid => out.push_str("uniqueidentifier"),
-            DataType::Decimal => out.push_str("decimal"),
-            DataType::Numeric => out.push_str("numeric"),
-            DataType::DecimalN => {
-                let _ = write!(out, "decimal({},{})", self.precision, self.scale);
-            }
-            DataType::NumericN => {
-                let _ = write!(out, "numeric({},{})", self.precision, self.scale);
-            }
-            DataType::MoneyN => {
-                let _ = write!(out, "money({})", self.scale);
-            }
-            DataType::Xml => out.push_str("xml"),
-            DataType::UserDefined => out.push_str("user_defined_type"),
-            DataType::Text => out.push_str("text"),
-            DataType::Image => out.push_str("image"),
-            DataType::NText => out.push_str("ntext"),
-            DataType::Variant => out.push_str("sql_variant"),
         }
     }
 }
@@ -826,14 +469,6 @@ impl Collation {
             version,
         })
     }
-
-    pub(crate) fn put(&self, out: &mut Vec<u8>) {
-        let locale_sort_version =
-            self.locale | ((u32::from(self.flags.bits())) << 20) | ((self.version as u32) << 28);
-
-        out.extend_from_slice(&locale_sort_version.to_le_bytes());
-        out.push(self.sort);
-    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -881,154 +516,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_type_info_and_value_with_old_wire_constants() {
-        let payload = Bytes::copy_from_slice(&[
-            DataType::IntN as u8,
-            4,
-            4,
-            1,
-            0,
-            0,
-            0,
-            0xfe,
-            0,
-            0,
-            0xe0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ]);
+    fn parses_nullable_int_type_and_values() {
+        let payload = Bytes::from_static(&[0x26, 4, 4, 1, 0, 0, 0, 0]);
         let mut input = payload.as_ref();
-
         let type_info = TypeInfo::get(&mut input).unwrap();
 
-        assert_eq!(type_info, TypeInfo::new(DataType::IntN, 4));
+        assert_eq!(TypeInfo::new(DataType::IntN, 4), type_info);
         assert_eq!(
             Some(Bytes::from_static(&[1, 0, 0, 0])),
-            type_info.get_value(&payload, &mut input).unwrap()
+            type_info.get_value(&payload, &mut input).unwrap(),
         );
-    }
-
-    #[test]
-    fn put_round_trips_collation_for_nvarchar_type_info() {
-        let type_info = TypeInfo {
-            ty: DataType::NVarChar,
-            size: 8,
-            scale: 0,
-            precision: 0,
-            collation: Some(Collation {
-                locale: 0x0409,
-                flags: CollationFlags::IGNORE_CASE,
-                sort: 52,
-                version: 0,
-            }),
-        };
-
-        let mut out = Vec::new();
-        type_info.put(&mut out).unwrap();
-        let mut input = out.as_slice();
-
-        assert_eq!(type_info, TypeInfo::get(&mut input).unwrap());
-        assert!(input.is_empty());
-    }
-
-    #[test]
-    fn put_value_uses_old_byte_length_null_sentinel() {
-        let type_info = TypeInfo::new(DataType::IntN, 4);
-        let mut out = Vec::new();
-
-        type_info.put_value(&mut out, Option::<i32>::None).unwrap();
-
-        assert_eq!([0xff], out.as_slice());
-    }
-
-    #[test]
-    fn put_value_and_get_value_round_trip_max_nvarchar_blob() {
-        let type_info = TypeInfo::new(DataType::NVarChar, 0xffff);
-        let mut out = Vec::new();
-
-        type_info.put_value(&mut out, "hi").unwrap();
-
-        assert_eq!(&[4, 0, 0, 0, 0, 0, 0, 0], &out[..8]);
-        assert_eq!(&[4, 0, 0, 0], &out[8..12]);
-        assert_eq!(&[0, 0, 0, 0], &out[out.len() - 4..]);
-
-        let payload = Bytes::copy_from_slice(&out);
-        let mut input = payload.as_ref();
-        assert_eq!(
-            Some(Bytes::from_static(&[b'h', 0, b'i', 0])),
-            type_info.get_value(&payload, &mut input).unwrap()
-        );
-        assert!(input.is_empty());
-    }
-
-    #[test]
-    fn put_value_chunks_large_max_nvarchar_blob() {
-        let type_info = TypeInfo::new(DataType::NVarChar, 0xffff);
-        let value = "x".repeat(PLP_CHUNK_SIZE + 1);
-        let expected_len = value.encode_utf16().count() * 2;
-        let mut out = Vec::new();
-
-        type_info.put_value(&mut out, value.as_str()).unwrap();
-
-        let mut input = out.as_slice();
-        assert_eq!(expected_len as u64, read_u64_le(&mut input).unwrap());
-        let mut chunk_sizes = Vec::new();
-        loop {
-            let chunk_size = read_u32_le(&mut input).unwrap() as usize;
-            if chunk_size == 0 {
-                break;
-            }
-
-            chunk_sizes.push(chunk_size);
-            let _ = take(&mut input, chunk_size).unwrap();
-        }
-
-        assert_eq!(vec![PLP_CHUNK_SIZE, PLP_CHUNK_SIZE, 2], chunk_sizes);
-        assert!(input.is_empty());
-
-        let payload = Bytes::copy_from_slice(&out);
-        let mut input = payload.as_ref();
-        assert_eq!(
-            expected_len,
-            type_info
-                .get_value(&payload, &mut input)
-                .unwrap()
-                .unwrap()
-                .len()
-        );
-        assert!(input.is_empty());
-    }
-
-    #[test]
-    fn put_value_encodes_null_max_nvarchar_blob() {
-        let type_info = TypeInfo::new(DataType::NVarChar, 0xffff);
-        let mut out = Vec::new();
-
-        type_info
-            .put_value(&mut out, Option::<String>::None)
-            .unwrap();
-
-        assert_eq!(PLP_NULL.to_le_bytes(), out.as_slice());
-
-        let payload = Bytes::copy_from_slice(&out);
-        let mut input = payload.as_ref();
         assert_eq!(None, type_info.get_value(&payload, &mut input).unwrap());
         assert!(input.is_empty());
     }
 
     #[test]
-    fn formats_tds_type_declarations_like_old_protocol_module() {
-        let mut out = String::new();
-        TypeInfo::new(DataType::NVarChar, 12).fmt(&mut out);
+    fn parses_nvarchar_collation() {
+        let mut input = &[0xe7, 8, 0, 0x09, 0x04, 0x10, 0x00, 0x34][..];
 
-        assert_eq!("nvarchar(6)", out);
-        assert_eq!("NVARCHAR", TypeInfo::new(DataType::NVarChar, 12).name());
+        let type_info = TypeInfo::get(&mut input).unwrap();
+
+        assert_eq!(DataType::NVarChar, type_info.ty);
+        assert_eq!(8, type_info.size);
+        assert_eq!(
+            Some(Collation {
+                locale: 0x0409,
+                flags: CollationFlags(1),
+                sort: 52,
+                version: 0,
+            }),
+            type_info.collation,
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parses_chunked_max_nvarchar_with_known_or_unknown_length() {
+        let type_info = TypeInfo::new(DataType::NVarChar, 0xffff);
+        let chunks = [2, 0, 0, 0, b'h', 0, 2, 0, 0, 0, b'i', 0, 0, 0, 0, 0];
+
+        for length in [4_u64, 0xffff_ffff_ffff_fffe] {
+            let mut wire = length.to_le_bytes().to_vec();
+            wire.extend_from_slice(&chunks);
+            let payload = Bytes::from(wire);
+            let mut input = payload.as_ref();
+
+            assert_eq!(
+                Some(Bytes::from_static(&[b'h', 0, b'i', 0])),
+                type_info.get_value(&payload, &mut input).unwrap(),
+            );
+            assert!(input.is_empty());
+        }
+    }
+
+    #[test]
+    fn parses_null_max_nvarchar() {
+        let type_info = TypeInfo::new(DataType::NVarChar, 0xffff);
+        let payload = Bytes::from_static(&[0xff; 8]);
+        let mut input = payload.as_ref();
+
+        assert_eq!(None, type_info.get_value(&payload, &mut input).unwrap());
+        assert!(input.is_empty());
     }
 }
