@@ -59,6 +59,8 @@ pub struct MssqlTypeInfo {
 }
 
 impl MssqlTypeInfo {
+    pub(crate) const DECIMAL_PRECISION: u8 = 38;
+
     /// Creates type information from a known SQL Server type family.
     pub const fn new(kind: MssqlType) -> Self {
         Self {
@@ -151,7 +153,7 @@ impl MssqlTypeInfo {
             ty: protocol::DataType::NumericN,
             size: 17,
             scale: 0,
-            precision: 38,
+            precision: Self::DECIMAL_PRECISION,
             collation: None,
         },
     );
@@ -221,7 +223,7 @@ impl MssqlTypeInfo {
                 ty: protocol::DataType::NumericN,
                 size: 17,
                 scale,
-                precision: 38,
+                precision: Self::DECIMAL_PRECISION,
                 collation: None,
             },
         )
