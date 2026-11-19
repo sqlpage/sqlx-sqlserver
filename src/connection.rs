@@ -171,16 +171,9 @@ impl MssqlConnection {
     }
 
     async fn run_sql_batch_direct(&mut self, sql: &str) -> Result<QueryOutput, Error> {
-        let transaction_descriptor = self.transaction_descriptor;
-        let stream = self.stream.as_mut().ok_or_else(wire_not_implemented)?;
-        let packet = build_sql_batch_packet(sql, stream.packet_size, transaction_descriptor)
+        let packet = build_sql_batch_packet(sql, self.packet_size()?, self.transaction_descriptor)
             .map_err(frame_error)?;
-        stream
-            .write_all(&packet)
-            .await
-            .map_err(|error| context_error("failed to send SQL Server SQL batch packet", error))?;
-
-        self.read_query_response("SQL batch").await
+        self.read_query_response(&packet, "SQL batch").await
     }
 
     pub(crate) fn queue_rollback(&mut self) {
@@ -213,48 +206,28 @@ impl MssqlConnection {
         sql: &str,
         arguments: Option<&MssqlArguments>,
     ) -> Result<QueryEvents, Error> {
-        let operation = self.send_execute_sql(sql, arguments).await?;
-        let payload = self.read_query_response_payload(operation).await?;
-        Ok(QueryEvents::new(payload))
-    }
-
-    async fn send_execute_sql(
-        &mut self,
-        sql: &str,
-        arguments: Option<&MssqlArguments>,
-    ) -> Result<&'static str, Error> {
         self.flush_pending_rollback().await?;
 
-        match arguments {
+        let packet_size = self.packet_size()?;
+        let transaction_descriptor = self.transaction_descriptor;
+        let (packet, operation) = match arguments {
             Some(arguments) if !arguments.is_empty() => {
-                let transaction_descriptor = self.transaction_descriptor;
-                let stream = self.stream.as_mut().ok_or_else(wire_not_implemented)?;
-                let packet = build_execute_sql_packet(
-                    sql,
-                    arguments,
-                    stream.packet_size,
-                    transaction_descriptor,
-                )
-                .map_err(|error| {
-                    Error::Protocol(format!("failed to encode SQL Server RPC: {error}"))
-                })?;
-                stream.write_all(&packet).await.map_err(|error| {
-                    context_error("failed to send SQL Server RPC execute packet", error)
-                })?;
-                Ok("RPC execute")
+                let packet =
+                    build_execute_sql_packet(sql, arguments, packet_size, transaction_descriptor)
+                        .map_err(|error| {
+                        Error::Protocol(format!("failed to encode SQL Server RPC: {error}"))
+                    })?;
+                (packet, "RPC execute")
             }
             _ => {
-                let transaction_descriptor = self.transaction_descriptor;
-                let stream = self.stream.as_mut().ok_or_else(wire_not_implemented)?;
-                let packet =
-                    build_sql_batch_packet(sql, stream.packet_size, transaction_descriptor)
-                        .map_err(frame_error)?;
-                stream.write_all(&packet).await.map_err(|error| {
-                    context_error("failed to send SQL Server SQL batch packet", error)
-                })?;
-                Ok("SQL batch")
+                let packet = build_sql_batch_packet(sql, packet_size, transaction_descriptor)
+                    .map_err(frame_error)?;
+                (packet, "SQL batch")
             }
-        }
+        };
+
+        let payload = self.exchange(&packet, operation).await?;
+        Ok(QueryEvents::new(payload))
     }
 
     pub(crate) async fn run_prepare(
@@ -264,40 +237,47 @@ impl MssqlConnection {
     ) -> Result<QueryOutput, Error> {
         self.flush_pending_rollback().await?;
 
-        let transaction_descriptor = self.transaction_descriptor;
-        let stream = self.stream.as_mut().ok_or_else(wire_not_implemented)?;
-        let packet =
-            build_prepare_packet(sql, parameters, stream.packet_size, transaction_descriptor)
-                .map_err(|error| {
-                    Error::Protocol(format!("failed to encode SQL Server prepare RPC: {error}"))
-                })?;
-        stream.write_all(&packet).await.map_err(|error| {
-            context_error("failed to send SQL Server prepare RPC packet", error)
+        let packet = build_prepare_packet(
+            sql,
+            parameters,
+            self.packet_size()?,
+            self.transaction_descriptor,
+        )
+        .map_err(|error| {
+            Error::Protocol(format!("failed to encode SQL Server prepare RPC: {error}"))
         })?;
-
-        let output = self.read_query_response("prepare RPC").await?;
+        let output = self.read_query_response(&packet, "prepare RPC").await?;
 
         if let Some(statement_id) = first_i32_return_value(&output)? {
-            let transaction_descriptor = self.transaction_descriptor;
-            let stream = self.stream.as_mut().ok_or_else(wire_not_implemented)?;
-            let packet =
-                build_unprepare_packet(statement_id, stream.packet_size, transaction_descriptor)
-                    .map_err(|error| {
-                        Error::Protocol(format!(
-                            "failed to encode SQL Server unprepare RPC: {error}"
-                        ))
-                    })?;
-            stream.write_all(&packet).await.map_err(|error| {
-                context_error("failed to send SQL Server unprepare RPC packet", error)
+            let packet = build_unprepare_packet(
+                statement_id,
+                self.packet_size()?,
+                self.transaction_descriptor,
+            )
+            .map_err(|error| {
+                Error::Protocol(format!(
+                    "failed to encode SQL Server unprepare RPC: {error}"
+                ))
             })?;
-            let _ = self.read_query_response("unprepare RPC").await?;
+            self.read_query_response(&packet, "unprepare RPC").await?;
         }
 
         Ok(output)
     }
 
-    async fn read_query_response(&mut self, operation: &'static str) -> Result<QueryOutput, Error> {
-        let payload = self.read_query_response_payload(operation).await?;
+    fn packet_size(&self) -> Result<usize, Error> {
+        self.stream
+            .as_ref()
+            .map(|stream| stream.packet_size)
+            .ok_or_else(stream_unavailable)
+    }
+
+    async fn read_query_response(
+        &mut self,
+        packet: &[u8],
+        operation: &'static str,
+    ) -> Result<QueryOutput, Error> {
+        let payload = self.exchange(packet, operation).await?;
         let output = parse_query_response(&payload).map_err(|error| {
             Error::Protocol(format!(
                 "failed to parse SQL Server {operation} response: {error}"
@@ -307,11 +287,16 @@ impl MssqlConnection {
         Ok(output)
     }
 
-    async fn read_query_response_payload(
-        &mut self,
-        operation: &'static str,
-    ) -> Result<Vec<u8>, Error> {
-        let stream = self.stream.as_mut().ok_or_else(wire_not_implemented)?;
+    async fn exchange(&mut self, packet: &[u8], operation: &'static str) -> Result<Vec<u8>, Error> {
+        // Dropping an in-flight exchange closes the socket. The next request cannot
+        // safely reuse it after a partial write or an unread reply.
+        let mut stream = self.stream.take().ok_or_else(stream_unavailable)?;
+        stream.write_all(packet).await.map_err(|error| {
+            context_error(
+                format!("failed to send SQL Server {operation} packet"),
+                error,
+            )
+        })?;
         let response = stream.read_message().await.map_err(|error| {
             context_error(
                 format!("failed to read SQL Server {operation} response"),
@@ -325,6 +310,7 @@ impl MssqlConnection {
             )));
         }
 
+        self.stream = Some(stream);
         Ok(response.payload)
     }
 
@@ -372,13 +358,8 @@ impl Connection for MssqlConnection {
     }
 
     async fn ping(&mut self) -> Result<(), Error> {
-        self.flush_pending_rollback().await?;
-
-        if self.stream.is_some() {
-            Ok(())
-        } else {
-            Err(wire_not_implemented())
-        }
+        self.run_sql_batch("SELECT 1").await?;
+        Ok(())
     }
 
     fn begin(
@@ -475,8 +456,11 @@ fn first_i32_return_value(output: &QueryOutput) -> Result<Option<i32>, Error> {
         .transpose()
 }
 
-pub(crate) fn wire_not_implemented() -> Error {
-    Error::Protocol("SQL Server connection stream is not available".to_owned())
+fn stream_unavailable() -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        "SQL Server connection is closed",
+    ))
 }
 
 struct MssqlWireStream {
@@ -856,5 +840,55 @@ mod tests {
         let err = tds_packet_slice(&bytes[..bytes.len() - 1], 24).unwrap_err();
 
         assert!(err.to_string().contains("ended inside a packet"));
+    }
+
+    #[tokio::test]
+    async fn ping_rejects_a_socket_closed_by_the_server() {
+        let (mut conn, server) = loopback_connection().await;
+        drop(server);
+
+        assert!(matches!(conn.ping().await, Err(Error::Io(_))));
+        assert!(conn.stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_query_while_awaiting_a_reply_closes_the_socket() {
+        let (mut conn, mut server) = loopback_connection().await;
+        let mut query = Box::pin(conn.run_sql_batch("SELECT 1"));
+        let mut header = [0; PACKET_HEADER_LEN];
+
+        tokio::select! {
+            result = &mut query => panic!("query finished before the server sent a reply: {result:?}"),
+            result = server.read_exact(&mut header) => { result.unwrap(); }
+        }
+
+        assert_eq!(
+            PacketHeader::decode(&header).unwrap().packet_type,
+            PacketType::SQL_BATCH
+        );
+        drop(query);
+        assert!(matches!(
+            conn.ping().await,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotConnected
+        ));
+    }
+
+    async fn loopback_connection() -> (MssqlConnection, TcpStream) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, server) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let conn = MssqlConnection {
+            stream: Some(MssqlWireStream {
+                stream: MssqlStream::Raw(client.unwrap()),
+                packet_size: 4096,
+            }),
+            transaction_depth: 0,
+            transaction_descriptor: 0,
+            pending_rollback_sql: None,
+        };
+
+        (conn, server.unwrap().0)
     }
 }
