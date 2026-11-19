@@ -52,20 +52,23 @@ impl MssqlArguments {
         encoded: Vec<u8>,
         is_null: bool,
     ) -> Result<(), BoxDynError> {
-        self.len += 1;
-        let name = format!("@p{}", self.len);
+        let name = format!("@p{}", self.len + 1);
+        let declaration = declaration(&type_info, encoded.len(), is_null)?;
+        let data_len = self.data.len();
+
+        if let Err(error) = write_parameter(&mut self.data, &name, &type_info, &encoded, is_null) {
+            self.data.truncate(data_len);
+            return Err(error);
+        }
 
         if !self.declarations.is_empty() {
             self.declarations.push(',');
         }
 
-        write!(
-            self.declarations,
-            "{name} {}",
-            declaration(&type_info, encoded.len(), is_null)?
-        )?;
-
-        write_parameter(&mut self.data, &name, &type_info, &encoded, is_null)?;
+        self.declarations.push_str(&name);
+        self.declarations.push(' ');
+        self.declarations.push_str(&declaration);
+        self.len += 1;
         Ok(())
     }
 }
@@ -444,6 +447,24 @@ fn write_utf16(out: &mut Vec<u8>, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_parameter_encoding_leaves_existing_arguments_intact() {
+        let mut args = MssqlArguments::default();
+        args.add(7_i32).unwrap();
+        let mut expected = args.clone();
+
+        assert!(args
+            .add_parameter(MssqlTypeInfo::INT, vec![0; 256], false)
+            .is_err());
+
+        args.add(8_i32).unwrap();
+        expected.add(8_i32).unwrap();
+
+        assert_eq!(args.len(), expected.len());
+        assert_eq!(args.declarations(), expected.declarations());
+        assert_eq!(args.data(), expected.data());
+    }
 
     #[test]
     fn formats_sql_server_style_placeholders() {
