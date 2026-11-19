@@ -526,7 +526,11 @@ impl Decode<'_, Mssql> for String {
             .ok_or_else(|| "cannot decode SQL Server NULL as String".to_owned())?;
 
         if matches!(value.type_info.kind(), MssqlType::VarChar) {
-            return Ok(std::str::from_utf8(bytes)?.to_owned());
+            let encoding = varchar_encoding(value.type_info);
+            let text = encoding
+                .decode_without_bom_handling_and_without_replacement(bytes)
+                .ok_or("invalid SQL Server VARCHAR text for its collation")?;
+            return Ok(text.into_owned());
         }
 
         if bytes.len() % 2 != 0 {
@@ -550,8 +554,20 @@ impl<'r> Decode<'r, Mssql> for &'r str {
             return Err("borrowed SQL Server &str decoding is only supported for VARCHAR; NVARCHAR requires UTF-16 allocation".into());
         }
 
-        Ok(std::str::from_utf8(non_null_bytes(value, "&str")?)?)
+        let encoding = varchar_encoding(value.type_info);
+        let bytes = non_null_bytes(value, "&str")?;
+        if encoding != encoding_rs::UTF_8 && !bytes.is_ascii() {
+            return Err("borrowed SQL Server &str requires UTF-8 or ASCII text; use String to decode this collation".into());
+        }
+        Ok(std::str::from_utf8(bytes)?)
     }
+}
+
+fn varchar_encoding(type_info: &MssqlTypeInfo) -> &'static encoding_rs::Encoding {
+    type_info
+        .protocol_type_info()
+        .and_then(|info| info.collation)
+        .map_or(encoding_rs::UTF_8, |collation| collation.encoding())
 }
 
 impl Type<Mssql> for [u8] {

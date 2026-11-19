@@ -338,11 +338,19 @@ async fn fetches_native_scalar_arguments_when_configured() -> Result<(), Box<dyn
 async fn fetches_varchar_text_when_configured() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = native_test_conn().await?;
 
-    let row = sqlx_core::query::query("SELECT CAST('hello' AS VARCHAR(5))")
-        .fetch_one(&mut conn)
-        .await?;
+    let row = sqlx_core::query::query(
+        "SELECT CAST('hello' AS VARCHAR(5)), \
+         CAST(N'gères' COLLATE Latin1_General_100_CI_AS AS VARCHAR(20)), \
+         CAST(N'東京' COLLATE Japanese_CI_AS AS VARCHAR(20)), \
+         CAST(N'東京' COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS VARCHAR(20))",
+    )
+    .fetch_one(&mut conn)
+    .await?;
 
-    assert_eq!("hello", row.try_get::<String, _>(0)?);
+    assert_eq!("hello", row.try_get::<&str, _>(0)?);
+    assert_eq!("gères", row.try_get::<String, _>(1)?);
+    assert_eq!("東京", row.try_get::<String, _>(2)?);
+    assert_eq!("東京", row.try_get::<String, _>(3)?);
 
     conn.close().await?;
     Ok(())

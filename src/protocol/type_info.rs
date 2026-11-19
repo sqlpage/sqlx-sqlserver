@@ -20,9 +20,10 @@ impl CollationFlags {
     pub(crate) const IGNORE_KANA: Self = Self(1 << 3);
     pub(crate) const BINARY: Self = Self(1 << 4);
     pub(crate) const BINARY2: Self = Self(1 << 5);
+    const UTF8: Self = Self(1 << 6);
 
     pub(crate) const fn from_bits_truncate(bits: u8) -> Self {
-        Self(bits & 0x3f)
+        Self(bits & 0x7f)
     }
 
     pub(crate) const fn bits(self) -> u8 {
@@ -814,6 +815,68 @@ impl DataType {
 }
 
 impl Collation {
+    pub(crate) fn encoding(self) -> &'static encoding_rs::Encoding {
+        if self.flags.bits() & CollationFlags::UTF8.bits() != 0 {
+            return encoding_rs::UTF_8;
+        }
+
+        // SQL Server reports a Windows locale identifier in the collation.
+        // Keep the code page mapping used by sqlx-oldapi.
+        match self.locale {
+            // Arabic locales
+            0x0401 | 0x3801 | 0x3C01 | 0x1401 | 0x0C01 | 0x0801 | 0x2C01 | 0x3401 | 0x3001
+            | 0x1001 | 0x1801 | 0x2001 | 0x4001 | 0x2801 | 0x1C01 | 0x2401 | 0x0429 | 0x0492
+            | 0x0846 | 0x048C | 0x0859 | 0x0420 | 0x0820 | 0x045F | 0x0480 => {
+                encoding_rs::WINDOWS_1256
+            }
+
+            // Chinese locales
+            0x0804 | 0x50804 | 0x20804 | 0x1004 | 0x51004 | 0x21004 => encoding_rs::GBK,
+            0x0C04 | 0x40C04 | 0x1404 | 0x41404 | 0x21404 | 0x0404 | 0x30404 | 0x40404 => {
+                encoding_rs::BIG5
+            }
+
+            // Cyrillic locales
+            0x082C | 0x046D | 0x0423 | 0x0402 | 0x201A | 0x0440 | 0x042F | 0x0450 | 0x0419
+            | 0x0819 | 0x0485 | 0x0428 | 0x0444 | 0x0422 | 0x0843 | 0x281A | 0x1C1A | 0x301A => {
+                encoding_rs::WINDOWS_1251
+            }
+
+            // Central European locales
+            0x141A | 0x0405 | 0x041A | 0x101A | 0x040E | 0x1040E | 0x0415 | 0x0418 | 0x0818
+            | 0x041B | 0x0424 | 0x041C | 0x241A | 0x181A | 0x2C1A | 0x0442 => {
+                encoding_rs::WINDOWS_1250
+            }
+
+            // Baltic locales
+            0x0425..=0x0427 => encoding_rs::WINDOWS_1257,
+
+            // Greek
+            0x0408 => encoding_rs::WINDOWS_1253,
+
+            // Hebrew
+            0x040D => encoding_rs::WINDOWS_1255,
+
+            // Japanese
+            0x0411 | 0x40411 => encoding_rs::SHIFT_JIS,
+
+            // Korean
+            0x0412 => encoding_rs::EUC_KR,
+
+            // Thai
+            0x041E => encoding_rs::WINDOWS_874,
+
+            // Turkish
+            0x042C | 0x041F | 0x0443 => encoding_rs::WINDOWS_1254,
+
+            // Vietnamese
+            0x042A => encoding_rs::WINDOWS_1258,
+
+            // Western European/US locales - default for unhandled LCIDs
+            _ => encoding_rs::WINDOWS_1252,
+        }
+    }
+
     pub(crate) fn get(input: &mut &[u8]) -> Result<Collation, TypeInfoError> {
         let locale_sort_version = read_u32_le(input)?;
         let locale = locale_sort_version & 0xfffff;
