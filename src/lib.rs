@@ -62,9 +62,12 @@
 //! ```
 //!
 //! The examples use `trust_server_certificate=true` for local development with
-//! SQL Server's self-signed container certificate. Production deployments should
-//! prefer a trusted certificate and, when needed, `hostname_in_certificate` or
-//! `ssl_root_cert` in [`MssqlConnectOptions`].
+//! SQL Server's self-signed container certificate. By default the driver
+//! validates the certificate chain and server hostname. Set
+//! `hostname_in_certificate` or `ssl_root_cert` in [`MssqlConnectOptions`] when
+//! using a separate certificate name or private certificate authority. The
+//! driver supports mandatory TLS with TDS 7.x. SQL Server's strict mode
+//! requires TDS 8.0.
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
