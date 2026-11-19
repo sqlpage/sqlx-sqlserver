@@ -548,4 +548,21 @@ mod tests {
             .windows(8)
             .any(|bytes| bytes == 8001_u64.to_le_bytes()));
     }
+
+    #[test]
+    fn frames_large_bound_binary_as_length_prefixed_chunks() {
+        let mut args = MssqlArguments::default();
+        let data = vec![0x5a; 8193];
+        args.add(data.as_slice()).unwrap();
+
+        let mut expected = vec![3, b'@', 0, b'p', 0, b'1', 0, 0, 0xa5, 0xff, 0xff];
+        expected.extend_from_slice(&8193_u64.to_le_bytes());
+        expected.extend_from_slice(&8192_u32.to_le_bytes());
+        expected.extend_from_slice(&data[..8192]);
+        expected.extend_from_slice(&1_u32.to_le_bytes());
+        expected.push(0x5a);
+        expected.extend_from_slice(&0_u32.to_le_bytes());
+
+        assert_eq!(expected, args.data());
+    }
 }
