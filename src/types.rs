@@ -129,31 +129,61 @@ impl Type<Mssql> for BigDecimal {
 #[cfg(feature = "bigdecimal")]
 impl Encode<'_, Mssql> for BigDecimal {
     fn produces(&self) -> Option<MssqlTypeInfo> {
-        let (_, exponent) = self.as_bigint_and_exponent();
-        Some(MssqlTypeInfo::decimal_with_scale(
-            u8::try_from(exponent).unwrap_or(0),
-        ))
+        bigdecimal_parts(self).map(|(_, scale)| MssqlTypeInfo::decimal_with_scale(scale))
     }
 
     fn encode_by_ref(&self, buf: &mut Vec<u8>) -> Result<IsNull, BoxDynError> {
-        let (mut bigint, exponent) = self.as_bigint_and_exponent();
-        buf.push(if bigint.sign() == Sign::Minus { 0 } else { 1 });
-
-        if exponent < 0 {
-            if let Ok(abs_exponent) = u32::try_from(-exponent) {
-                bigint *= BigInt::from(10).pow(abs_exponent);
-            }
-        }
-
-        let (_, bytes) = bigint.to_bytes_le();
-        let mut mantissa = [0_u8; 16];
-        if exponent <= i64::from(u8::MAX) && bytes.len() <= mantissa.len() {
-            mantissa[..bytes.len()].copy_from_slice(&bytes);
-        }
-
-        buf.extend_from_slice(&mantissa);
+        let (mantissa, _) = bigdecimal_parts(self)
+            .ok_or("BigDecimal cannot be represented exactly as SQL Server DECIMAL")?;
+        buf.push(u8::from(self.sign() != Sign::Minus));
+        buf.extend_from_slice(&mantissa.to_le_bytes());
         Ok(IsNull::No)
     }
+}
+
+#[cfg(feature = "bigdecimal")]
+fn bigdecimal_parts(value: &BigDecimal) -> Option<(u128, u8)> {
+    const PRECISION: u8 = MssqlTypeInfo::DECIMAL_PRECISION;
+    const LIMIT: u128 = 10_u128.pow(PRECISION as u32);
+
+    let (coefficient, scale) = value.as_bigint_and_scale();
+    let magnitude = coefficient.magnitude();
+    if magnitude.bits() == 0 {
+        return Some((0, scale.clamp(0, i64::from(PRECISION)) as u8));
+    }
+
+    if scale < 0 {
+        let zeros = u32::try_from(scale.unsigned_abs()).ok()?;
+        let mantissa = u128::try_from(magnitude)
+            .ok()?
+            .checked_mul(10_u128.checked_pow(zeros)?)?;
+        return (mantissa < LIMIT).then_some((mantissa, 0));
+    }
+
+    if let (Ok(scale), Ok(mantissa)) = (u8::try_from(scale), u128::try_from(magnitude)) {
+        if scale <= PRECISION && mantissa < LIMIT {
+            return Some((mantissa, scale));
+        }
+    }
+
+    // Keep as much of the original scale as SQL Server allows. Removing decimal
+    // digits preserves the value only when all the removed digits are zero.
+    let digits = magnitude.to_radix_be(10);
+    let scale = scale as u64;
+    let excess_scale = scale.saturating_sub(u64::from(PRECISION));
+    let excess_digits = digits.len().saturating_sub(usize::from(PRECISION)) as u64;
+    let remove = excess_scale.max(excess_digits);
+    let scale = u8::try_from(scale.checked_sub(remove)?).ok()?;
+    let keep = digits.len().checked_sub(usize::try_from(remove).ok()?)?;
+    let (digits, trailing) = digits.split_at(keep);
+    if trailing.iter().any(|digit| *digit != 0) {
+        return None;
+    }
+
+    let mantissa = digits
+        .iter()
+        .fold(0, |mantissa, &digit| mantissa * 10 + u128::from(digit));
+    Some((mantissa, scale))
 }
 
 #[cfg(feature = "bigdecimal")]
@@ -691,4 +721,49 @@ fn decode_time_datetime2(scale: u8, bytes: &[u8]) -> Result<time::PrimitiveDateT
         decode_time_date(&bytes[time_size..])?,
         decode_time_time(scale, &bytes[..time_size])?,
     ))
+}
+
+#[cfg(all(test, feature = "bigdecimal"))]
+mod bigdecimal_tests {
+    use super::*;
+    use crate::{MssqlArguments, MssqlValue};
+    use bytes::Bytes;
+    use sqlx_core::arguments::Arguments;
+    use sqlx_core::value::Value;
+
+    #[test]
+    fn binds_bigdecimal_exactly_with_the_largest_supported_scale() {
+        for (text, scale) in [
+            ("12.3400", 4),
+            ("-1e37", 0),
+            ("99999999999999999999999999999999999999", 0),
+            ("-99999999999999999999999999999999999999.000", 0),
+            ("100e-40", 38),
+            ("0e-40", 38),
+        ] {
+            let value: BigDecimal = text.parse().unwrap();
+            let mut args = MssqlArguments::default();
+            args.add(value.clone()).unwrap();
+
+            assert_eq!(format!("@p1 decimal(38,{scale})"), args.declarations());
+            let wire = Bytes::copy_from_slice(args.data().last_chunk::<17>().unwrap());
+            let decoded = MssqlValue::new(MssqlTypeInfo::decimal_with_scale(scale), Some(wire));
+            assert_eq!(value, BigDecimal::decode(decoded.as_ref()).unwrap());
+        }
+    }
+
+    #[test]
+    fn rejects_bigdecimal_that_requires_rounding_or_overflows() {
+        for value in [
+            "99999999999999999999999999999999999999999".parse().unwrap(),
+            "1e38".parse().unwrap(),
+            "1e-39".parse().unwrap(),
+            BigDecimal::new(BigInt::from(1), i64::MIN),
+            BigDecimal::new(BigInt::from(1), i64::MAX),
+        ] {
+            let mut args = MssqlArguments::default();
+            assert!(args.add(value).is_err());
+            assert!(args.is_empty());
+        }
+    }
 }
