@@ -462,7 +462,9 @@ impl Encode<'_, Mssql> for f64 {
 
 impl Type<Mssql> for str {
     fn type_info() -> MssqlTypeInfo {
-        MssqlTypeInfo::NVARCHAR
+        // NULL strings have no value from which to infer length. ISNULL uses
+        // the first operand's type and length, so use NVARCHAR(MAX).
+        MssqlTypeInfo::with_size(MssqlType::NVarChar, u16::MAX)
     }
 
     fn compatible(ty: &MssqlTypeInfo) -> bool {

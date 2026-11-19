@@ -449,6 +449,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn null_strings_use_nvarchar_max_in_declarations_and_rpc_values() {
+        let mut args = MssqlArguments::default();
+        args.add(None::<String>).unwrap();
+
+        assert_eq!("@p1 nvarchar(max)", args.declarations());
+        assert!(args
+            .data
+            .windows(3)
+            .any(|bytes| bytes == [DATA_TYPE_NVARCHAR, 0xff, 0xff]));
+        assert!(args.data.ends_with(&PLP_NULL.to_le_bytes()));
+    }
+
+    #[test]
     fn failed_parameter_encoding_leaves_existing_arguments_intact() {
         let mut args = MssqlArguments::default();
         args.add(7_i32).unwrap();
