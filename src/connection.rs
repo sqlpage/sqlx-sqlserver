@@ -716,22 +716,21 @@ fn negotiate_encryption(requested: Encrypt, server: Encrypt) -> std::result::Res
             "SQL Server requires encryption, but the client URL requested encrypt=not_supported"
                 .to_owned(),
         )),
-        (Encrypt::Required, Encrypt::Off | Encrypt::NotSupported) => Err(Error::Tls(
+        (Encrypt::On | Encrypt::Required, Encrypt::Off | Encrypt::NotSupported) => Err(Error::Tls(
             "SQL Server TLS encryption is required but not supported by the server".into(),
         )),
         (Encrypt::On | Encrypt::Required, Encrypt::On | Encrypt::Required) => Ok(true),
-        (Encrypt::Off, _) | (_, Encrypt::Off) => Err(Error::Protocol(
-            "SQL Server login-only TLS fallback is not implemented yet; use encrypt=mandatory or encrypt=strict for encrypted connections, or encrypt=not_supported for plaintext development servers"
+        (Encrypt::Off, _) => Err(Error::Protocol(
+            "SQL Server login-only TLS fallback is not implemented yet; use encrypt=mandatory for encrypted connections, or encrypt=not_supported for plaintext development servers"
                 .to_owned(),
         )),
-        (Encrypt::On, Encrypt::NotSupported) => Ok(false),
     }
 }
 
 fn build_tls_connector(options: &MssqlConnectOptions) -> Result<TlsConnector, Error> {
     let mut builder = native_tls::TlsConnector::builder();
     builder.danger_accept_invalid_certs(options.trust_server_certificate());
-    builder.danger_accept_invalid_hostnames(options.hostname_in_certificate().is_none());
+    builder.danger_accept_invalid_hostnames(options.trust_server_certificate());
 
     if let Some(path) = options.ssl_root_cert() {
         let cert = std::fs::read(path).map_err(|error| {
@@ -834,6 +833,7 @@ mod tests {
     fn rejects_login_only_tls_fallback_until_downgrade_is_available() {
         assert!(negotiate_encryption(Encrypt::Off, Encrypt::On).is_err());
         assert!(negotiate_encryption(Encrypt::On, Encrypt::Off).is_err());
+        assert!(negotiate_encryption(Encrypt::On, Encrypt::NotSupported).is_err());
     }
 
     #[test]

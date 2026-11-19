@@ -19,7 +19,7 @@ pub enum Encrypt {
     Off,
     /// Require encryption.
     On,
-    /// Require encryption and certificate validation.
+    /// The server requires encryption during TDS 7.x negotiation.
     Required,
 }
 
@@ -88,7 +88,7 @@ impl MssqlConnectOptions {
             database: "master".to_owned(),
             instance: None,
             encrypt: Encrypt::On,
-            trust_server_certificate: true,
+            trust_server_certificate: false,
             hostname_in_certificate: None,
             ssl_root_cert: None,
             requested_packet_size: 4096,
@@ -295,13 +295,22 @@ fn parse_url(input: &str) -> Result<MssqlConnectOptions, MssqlInvalidOption> {
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
             "instance" => options.instance = Some(value.into_owned()),
+            "encrypt" if value.eq_ignore_ascii_case("strict") => {
+                return Err(MssqlInvalidOption::InvalidValue {
+                    key: key.into_owned(),
+                    value: value.into_owned(),
+                    message: "strict requires TDS 8.0; use mandatory for encrypted TDS 7.x"
+                        .to_owned(),
+                });
+            }
             "encrypt" => {
                 options.encrypt =
                     parse_encrypt(&value).ok_or_else(|| MssqlInvalidOption::InvalidValue {
                         key: "encrypt".to_owned(),
                         value: value.into_owned(),
-                        message: "expected strict, mandatory, optional, not_supported, true, false, yes, or no"
-                            .to_owned(),
+                        message:
+                            "expected mandatory, optional, not_supported, true, false, yes, or no"
+                                .to_owned(),
                     })?;
             }
             "sslrootcert" | "ssl-root-cert" | "ssl-ca" => {
@@ -344,7 +353,6 @@ fn parse_url(input: &str) -> Result<MssqlConnectOptions, MssqlInvalidOption> {
 
 fn parse_encrypt(value: &str) -> Option<Encrypt> {
     match value.to_ascii_lowercase().as_str() {
-        "strict" => Some(Encrypt::Required),
         "mandatory" | "true" | "yes" => Some(Encrypt::On),
         "optional" | "false" | "no" => Some(Encrypt::Off),
         "not_supported" => Some(Encrypt::NotSupported),
@@ -473,17 +481,31 @@ mod tests {
 
     #[test]
     fn parses_encryption_options() {
-        let strict =
-            MssqlConnectOptions::parse_url("mssql://localhost/master?encrypt=strict").unwrap();
         let optional =
             MssqlConnectOptions::parse_url("mssql://localhost/master?encrypt=optional").unwrap();
         let disabled =
             MssqlConnectOptions::parse_url("mssql://localhost/master?encrypt=not_supported")
                 .unwrap();
 
-        assert_eq!(Encrypt::Required, strict.encrypt());
         assert_eq!(Encrypt::Off, optional.encrypt());
         assert_eq!(Encrypt::NotSupported, disabled.encrypt());
+    }
+
+    #[test]
+    fn verifies_server_certificates_by_default() {
+        assert!(!MssqlConnectOptions::new().trust_server_certificate());
+        let development = MssqlConnectOptions::parse_url(
+            "mssql://localhost/master?trust_server_certificate=true",
+        )
+        .unwrap();
+        assert!(development.trust_server_certificate());
+    }
+
+    #[test]
+    fn rejects_strict_encryption_without_tds_8() {
+        let error =
+            MssqlConnectOptions::parse_url("mssql://localhost/master?encrypt=Strict").unwrap_err();
+        assert!(error.to_string().contains("strict requires TDS 8.0"));
     }
 
     #[test]
