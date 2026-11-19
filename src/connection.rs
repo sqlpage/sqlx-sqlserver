@@ -28,6 +28,7 @@ use crate::protocol::rpc::{
 };
 use crate::protocol::token::{parse_login_response, EnvChange, LoginResponse};
 use crate::tls::TlsPreloginStream;
+use crate::transaction::rollback_statement;
 use crate::{
     ssrp, Encrypt, Mssql, MssqlArguments, MssqlConnectOptions, MssqlQueryResult, MssqlRow,
     MssqlStatement, MssqlTypeInfo,
@@ -39,7 +40,7 @@ pub struct MssqlConnection {
     stream: Option<MssqlWireStream>,
     transaction_depth: usize,
     transaction_descriptor: u64,
-    pending_rollback_sql: Option<&'static str>,
+    pending_rollback_depth: Option<usize>,
 }
 
 impl MssqlConnection {
@@ -109,7 +110,7 @@ impl MssqlConnection {
                     stream: Some(stream),
                     transaction_depth: 0,
                     transaction_descriptor: 0,
-                    pending_rollback_sql: None,
+                    pending_rollback_depth: None,
                 };
                 conn.apply_env_changes(&env_changes);
                 Ok(conn)
@@ -161,10 +162,6 @@ impl MssqlConnection {
         self.transaction_depth = self.transaction_depth.saturating_sub(1);
     }
 
-    pub(crate) fn clear_transaction_depth(&mut self) {
-        self.transaction_depth = 0;
-    }
-
     pub(crate) async fn run_sql_batch(&mut self, sql: &str) -> Result<QueryOutput, Error> {
         self.flush_pending_rollback().await?;
         self.run_sql_batch_direct(sql).await
@@ -184,27 +181,24 @@ impl MssqlConnection {
     }
 
     pub(crate) fn queue_rollback(&mut self) {
-        let sql = match self.transaction_depth {
-            0 => return,
-            1 => {
-                self.transaction_depth = 0;
-                "ROLLBACK TRANSACTION"
-            }
-            _ => {
-                self.transaction_depth -= 1;
-                "ROLLBACK TRANSACTION sqlx_savepoint"
-            }
-        };
+        let depth = self.transaction_depth;
+        if depth == 0 {
+            return;
+        }
 
-        self.pending_rollback_sql = Some(sql);
+        self.decrement_transaction_depth();
+        // Rolling back an ancestor also undoes changes made in its descendants.
+        self.pending_rollback_depth = Some(
+            self.pending_rollback_depth
+                .map_or(depth, |pending| pending.min(depth)),
+        );
     }
 
     async fn flush_pending_rollback(&mut self) -> Result<(), Error> {
-        let Some(sql) = self.pending_rollback_sql.take() else {
-            return Ok(());
-        };
-
-        self.run_sql_batch_direct(sql).await?;
+        if let Some(depth) = self.pending_rollback_depth.take() {
+            self.run_sql_batch_direct(rollback_statement(depth).as_ref())
+                .await?;
+        }
         Ok(())
     }
 

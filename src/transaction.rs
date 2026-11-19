@@ -1,7 +1,8 @@
 use sqlx_core::database::Database;
 use sqlx_core::error::Error;
-use sqlx_core::sql_str::SqlStr;
+use sqlx_core::sql_str::{AssertSqlSafe, SqlSafeStr, SqlStr};
 use sqlx_core::transaction::TransactionManager;
+use std::borrow::Cow;
 
 use crate::{Mssql, MssqlConnection};
 
@@ -12,11 +13,10 @@ impl TransactionManager for MssqlTransactionManager {
     type Database = Mssql;
 
     async fn begin(conn: &mut MssqlConnection, statement: Option<SqlStr>) -> Result<(), Error> {
-        let sql = statement.unwrap_or_else(|| {
-            if conn.transaction_depth() == 0 {
-                SqlStr::from_static("BEGIN TRANSACTION")
-            } else {
-                SqlStr::from_static("SAVE TRANSACTION sqlx_savepoint")
+        let sql = statement.unwrap_or_else(|| match conn.transaction_depth() {
+            0 => SqlStr::from_static("BEGIN TRANSACTION"),
+            depth => {
+                AssertSqlSafe(savepoint_statement("SAVE TRANSACTION", depth + 1)).into_sql_str()
             }
         });
 
@@ -37,11 +37,9 @@ impl TransactionManager for MssqlTransactionManager {
     }
 
     async fn rollback(conn: &mut MssqlConnection) -> Result<(), Error> {
-        if conn.transaction_depth() == 1 {
-            conn.run_sql_batch("ROLLBACK TRANSACTION").await?;
-            conn.clear_transaction_depth();
-        } else if conn.transaction_depth() > 1 {
-            conn.run_sql_batch("ROLLBACK TRANSACTION sqlx_savepoint")
+        let depth = conn.transaction_depth();
+        if depth > 0 {
+            conn.run_sql_batch(rollback_statement(depth).as_ref())
                 .await?;
             conn.decrement_transaction_depth();
         }
@@ -56,4 +54,17 @@ impl TransactionManager for MssqlTransactionManager {
     fn get_transaction_depth(conn: &<Self::Database as Database>::Connection) -> usize {
         conn.transaction_depth()
     }
+}
+
+pub(crate) fn rollback_statement(depth: usize) -> Cow<'static, str> {
+    if depth == 1 {
+        Cow::Borrowed("ROLLBACK TRANSACTION")
+    } else {
+        Cow::Owned(savepoint_statement("ROLLBACK TRANSACTION", depth))
+    }
+}
+
+fn savepoint_statement(action: &str, depth: usize) -> String {
+    // SQL Server limits savepoint names to 32 characters.
+    format!("{action} sqlx_savepoint_{depth:x}")
 }
