@@ -32,62 +32,39 @@ use std::borrow::Cow;
 // SQL Server query macros are intentionally not ported here; this crate does not
 // currently expose the macro integration needed for compile-time checked tests.
 
-fn database_url() -> Option<String> {
-    std::env::var("MSSQL_DATABASE_URL")
-        .ok()
-        .and_then(|url| match url.trim() {
-            "" => None,
-            url => Some(url.to_owned()),
-        })
+fn database_url() -> String {
+    let url = std::env::var("MSSQL_DATABASE_URL")
+        .expect("set MSSQL_DATABASE_URL to run SQL Server integration tests");
+    let url = url.trim();
+    assert!(!url.is_empty(), "MSSQL_DATABASE_URL must not be blank");
+    url.to_owned()
 }
 
 #[cfg(feature = "integration-tests")]
-async fn any_test_conn(
-    test_name: &str,
-) -> Result<Option<sqlx_core::any::AnyConnection>, Box<dyn std::error::Error>> {
+async fn any_test_conn() -> Result<sqlx_core::any::AnyConnection, sqlx_core::Error> {
     static INSTALL: Once = Once::new();
-
-    let Some(url) = database_url() else {
-        eprintln!("skipping {test_name}: MSSQL_DATABASE_URL is not set");
-        return Ok(None);
-    };
 
     INSTALL.call_once(|| {
         sqlx_core::any::driver::install_drivers(&[sqlx_sqlserver::any::DRIVER])
             .expect("SQL Server Any driver should install once");
     });
 
-    Ok(Some(sqlx_core::any::AnyConnection::connect(&url).await?))
-}
-
-#[cfg(all(feature = "integration-tests", feature = "migrate"))]
-async fn any_migrate_test_conn(
-    test_name: &str,
-) -> Result<Option<sqlx_core::any::AnyConnection>, Box<dyn std::error::Error>> {
-    any_test_conn(test_name).await
+    sqlx_core::any::AnyConnection::connect(&database_url()).await
 }
 
 #[cfg(feature = "integration-tests")]
-async fn native_test_conn(
-    test_name: &str,
-) -> Result<Option<sqlx_sqlserver::MssqlConnection>, Box<dyn std::error::Error>> {
-    let Some(url) = database_url() else {
-        eprintln!("skipping {test_name}: MSSQL_DATABASE_URL is not set");
-        return Ok(None);
-    };
-
-    let options = url.parse::<MssqlConnectOptions>()?;
-    Ok(Some(options.connect().await?))
+async fn native_test_conn() -> Result<sqlx_sqlserver::MssqlConnection, sqlx_core::Error> {
+    database_url()
+        .parse::<MssqlConnectOptions>()?
+        .connect()
+        .await
 }
 
 #[test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 fn mssql_database_url_is_parseable_when_set() {
-    let Some(url) = database_url() else {
-        eprintln!("skipping SQL Server smoke test: MSSQL_DATABASE_URL is not set");
-        return;
-    };
-
-    url.parse::<MssqlConnectOptions>()
+    database_url()
+        .parse::<MssqlConnectOptions>()
         .expect("MSSQL_DATABASE_URL should parse as SQL Server options");
 }
 
@@ -101,10 +78,9 @@ fn any_driver_exposes_migrate_database_when_feature_enabled() {
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn connects_and_pings_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server integration test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     conn.ping().await?;
     conn.close().await?;
@@ -114,10 +90,9 @@ async fn connects_and_pings_when_configured() -> Result<(), Box<dyn std::error::
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_select_one_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server query test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let row = sqlx_core::query::query("SELECT 1")
         .fetch_one(&mut conn)
@@ -131,12 +106,10 @@ async fn fetches_select_one_when_configured() -> Result<(), Box<dyn std::error::
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn runs_independent_connections_in_parallel_when_configured(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(url) = database_url() else {
-        eprintln!("skipping SQL Server async parallelism test: MSSQL_DATABASE_URL is not set");
-        return Ok(());
-    };
+    let url = database_url();
 
     let mut tasks = Vec::new();
 
@@ -182,10 +155,9 @@ async fn runs_independent_connections_in_parallel_when_configured(
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_bound_scalars_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server bound scalar test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let row = sqlx_core::query::query("SELECT @p1, @p2")
         .bind(7_i32)
@@ -202,10 +174,9 @@ async fn fetches_bound_scalars_when_configured() -> Result<(), Box<dyn std::erro
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_1000_rows_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server 1000 row fetch test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let mut rows = sqlx_core::query::query(
         "WITH n(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM n WHERE v < 1000) \
@@ -230,10 +201,9 @@ async fn fetches_1000_rows_when_configured() -> Result<(), Box<dyn std::error::E
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn execute_reports_rows_affected_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server rows affected test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     conn.execute("CREATE TABLE #rows_affected (id INT NOT NULL)")
         .await?;
@@ -263,11 +233,10 @@ async fn execute_reports_rows_affected_when_configured() -> Result<(), Box<dyn s
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_bound_large_text_and_binary_when_configured(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server large parameter test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let text = "x".repeat(4001);
     let row = sqlx_core::query::query("SELECT LEN(@p1), DATALENGTH(@p1)")
@@ -292,11 +261,10 @@ async fn fetches_bound_large_text_and_binary_when_configured(
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_string_with_special_chars_when_configured(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server special string test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let expected = "/\r\n\t\0\x1b!@#$/.%^\x1b&*()_+";
     let row = sqlx_core::query::query("SELECT @p1")
@@ -312,10 +280,9 @@ async fn fetches_string_with_special_chars_when_configured(
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn accepts_long_query_strings_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server long query string test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let row = sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
         "SELECT {} 42",
@@ -332,11 +299,10 @@ async fn accepts_long_query_strings_when_configured() -> Result<(), Box<dyn std:
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_native_scalar_arguments_when_configured() -> Result<(), Box<dyn std::error::Error>>
 {
-    let Some(mut conn) = native_test_conn("SQL Server native scalar argument test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let bytes = vec![0x01, 0x23, 0x45, 0x67];
     let row = sqlx_core::query::query(
@@ -368,10 +334,9 @@ async fn fetches_native_scalar_arguments_when_configured() -> Result<(), Box<dyn
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_varchar_text_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server varchar decode test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let row = sqlx_core::query::query("SELECT CAST('hello' AS VARCHAR(5))")
         .fetch_one(&mut conn)
@@ -385,11 +350,10 @@ async fn fetches_varchar_text_when_configured() -> Result<(), Box<dyn std::error
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_old_numeric_float_and_integer_behaviors_when_configured(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server numeric behavior test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let row = sqlx_core::query::query(
         "SELECT CAST(0.5678 AS NUMERIC(10,4)), CAST(939399419.1225182 AS DECIMAL(15,2)), CAST(123456789 AS DECIMAL(15,0)), CAST(-123456789 AS DECIMAL(15,0)), CAST('0.0001' AS MONEY)",
@@ -409,13 +373,12 @@ async fn fetches_old_numeric_float_and_integer_behaviors_when_configured(
 
 #[cfg(all(feature = "integration-tests", feature = "decimal"))]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_rust_decimal_numeric_and_money_when_configured(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use rust_decimal::Decimal;
 
-    let Some(mut conn) = native_test_conn("SQL Server rust_decimal type test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let row = sqlx_core::query::query(
         "SELECT CAST('123456789.987654321' AS DECIMAL(18,9)), CAST('-1' AS DECIMAL(1,0)), CAST('922337203685477.5807' AS MONEY), CAST('-214748.3648' AS SMALLMONEY)",
@@ -446,14 +409,13 @@ async fn fetches_rust_decimal_numeric_and_money_when_configured(
 
 #[cfg(all(feature = "integration-tests", feature = "bigdecimal"))]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_bigdecimal_numeric_and_money_when_configured(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bigdecimal::BigDecimal;
     use std::str::FromStr;
 
-    let Some(mut conn) = native_test_conn("SQL Server bigdecimal type test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let row = sqlx_core::query::query(
         "SELECT CAST('-12345678901234567890.012345678901234' AS DECIMAL(38,15)), CAST('-1234567890.1234' AS MONEY), CAST('-123456.1234' AS SMALLMONEY)",
@@ -480,13 +442,12 @@ async fn fetches_bigdecimal_numeric_and_money_when_configured(
 
 #[cfg(all(feature = "integration-tests", feature = "chrono"))]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_chrono_date_time_types_when_configured() -> Result<(), Box<dyn std::error::Error>>
 {
     use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 
-    let Some(mut conn) = native_test_conn("SQL Server chrono type test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let row = sqlx_core::query::query(
         "SELECT CAST('1901-05-08 23:58:59' AS DATETIME), CAST('2016-10-23 12:45:37.1234567' AS DATETIME2), CAST('1789-07-14' AS DATE), CAST('23:59:59.9999' AS TIME), CAST('2016-10-23 12:45:37.1234567 +02:00' AS DATETIMEOFFSET(7))",
@@ -535,13 +496,12 @@ async fn fetches_chrono_date_time_types_when_configured() -> Result<(), Box<dyn 
 
 #[cfg(all(feature = "integration-tests", feature = "time"))]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_time_crate_date_time_types_when_configured(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 
-    let Some(mut conn) = native_test_conn("SQL Server time crate type test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let row = sqlx_core::query::query(
         "SELECT CAST('2016-10-23 12:45:37.1234567' AS DATETIME2), CAST('1789-07-14' AS DATE), CAST('23:59:59.9999' AS TIME), CAST('2016-10-23 12:45:37.1234567 +02:00' AS DATETIMEOFFSET(7))",
@@ -574,13 +534,12 @@ async fn fetches_time_crate_date_time_types_when_configured(
 
 #[cfg(all(feature = "integration-tests", feature = "json"))]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_json_value_from_varchar_when_configured() -> Result<(), Box<dyn std::error::Error>>
 {
     use sqlx_core::types::Json;
 
-    let Some(mut conn) = native_test_conn("SQL Server JSON type test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let value = sqlx_core::query_scalar::query_scalar::<_, Json<serde_json::Value>>("SELECT '123'")
         .fetch_one(&mut conn)
@@ -594,12 +553,11 @@ async fn fetches_json_value_from_varchar_when_configured() -> Result<(), Box<dyn
 
 #[cfg(all(feature = "integration-tests", feature = "uuid"))]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_uniqueidentifier_uuid_when_configured() -> Result<(), Box<dyn std::error::Error>> {
     use uuid::Uuid;
 
-    let Some(mut conn) = native_test_conn("SQL Server UUID type test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let row = sqlx_core::query::query(
         "SELECT CAST('00000000-0000-0000-0000-000000000000' AS UNIQUEIDENTIFIER), CAST('6F9619FF-8B86-D011-B42D-00C04FC964FF' AS UNIQUEIDENTIFIER)",
@@ -619,10 +577,9 @@ async fn fetches_uniqueidentifier_uuid_when_configured() -> Result<(), Box<dyn s
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn fetches_bound_null_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server bound null test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let row = sqlx_core::query::query("SELECT @p1")
         .bind(Option::<i32>::None)
@@ -637,10 +594,9 @@ async fn fetches_bound_null_when_configured() -> Result<(), Box<dyn std::error::
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn prepares_statement_metadata_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server prepare test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let statement = conn
         .prepare(sqlx_core::sql_str::SqlStr::from_static(
@@ -664,10 +620,9 @@ async fn prepares_statement_metadata_when_configured() -> Result<(), Box<dyn std
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn prepares_then_statement_query_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server statement query test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let statement = (&mut conn)
         .prepare(sqlx_core::sql_str::SqlStr::from_static(
@@ -690,10 +645,9 @@ async fn prepares_then_statement_query_when_configured() -> Result<(), Box<dyn s
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn rolls_back_transaction_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server transaction test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let tx = conn.begin().await?;
     tx.rollback().await?;
@@ -704,10 +658,9 @@ async fn rolls_back_transaction_when_configured() -> Result<(), Box<dyn std::err
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn supports_nested_transactions_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server nested transaction test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let table_name = "_sqlx_nested_tx_smoke";
     conn.execute(sqlx_core::sql_str::AssertSqlSafe(format!(
@@ -762,11 +715,9 @@ async fn supports_nested_transactions_when_configured() -> Result<(), Box<dyn st
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn dropped_transaction_rolls_back_on_next_use() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server dropped transaction rollback test").await?
-    else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let table_name = "_sqlx_drop_rollback_smoke";
     let _ = conn
@@ -807,6 +758,7 @@ async fn dropped_transaction_rolls_back_on_next_use() -> Result<(), Box<dyn std:
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn pool_callbacks_when_configured() -> Result<(), Box<dyn std::error::Error>> {
     #[derive(Debug, PartialEq, Eq)]
     struct ConnStats {
@@ -831,10 +783,7 @@ async fn pool_callbacks_when_configured() -> Result<(), Box<dyn std::error::Erro
         })
     }
 
-    let Some(url) = database_url() else {
-        eprintln!("skipping SQL Server pool callbacks test: MSSQL_DATABASE_URL is not set");
-        return Ok(());
-    };
+    let url = database_url();
 
     let current_id = AtomicI32::new(0);
 
@@ -933,11 +882,10 @@ async fn pool_callbacks_when_configured() -> Result<(), Box<dyn std::error::Erro
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn query_builder_binds_mssql_placeholders_when_configured(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server QueryBuilder test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     conn.execute("CREATE TABLE #qb_test (id INT PRIMARY KEY, name NVARCHAR(50))")
         .await?;
@@ -985,11 +933,9 @@ async fn query_builder_binds_mssql_placeholders_when_configured(
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn inspects_database_errors_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server database error inspection test").await?
-    else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let error = sqlx_core::query::query("select\nf")
         .execute(&mut conn)
@@ -1007,10 +953,9 @@ async fn inspects_database_errors_when_configured() -> Result<(), Box<dyn std::e
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn any_fetches_bound_integer_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = any_test_conn("SQL Server Any bound argument test").await? else {
-        return Ok(());
-    };
+    let mut conn = any_test_conn().await?;
 
     let row = sqlx_core::query::query("SELECT @p1")
         .bind(7_i32)
@@ -1025,12 +970,10 @@ async fn any_fetches_bound_integer_when_configured() -> Result<(), Box<dyn std::
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn any_fetches_text_blob_bool_and_typed_null_arguments_when_configured(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = any_test_conn("SQL Server Any text/blob/bool/null argument test").await?
-    else {
-        return Ok(());
-    };
+    let mut conn = any_test_conn().await?;
 
     let bytes = vec![0xde, 0xad, 0xbe, 0xef];
     let row = sqlx_core::query::query("SELECT @p1, @p2, @p3, @p4")
@@ -1052,11 +995,10 @@ async fn any_fetches_text_blob_bool_and_typed_null_arguments_when_configured(
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn any_prepares_statement_metadata_when_configured() -> Result<(), Box<dyn std::error::Error>>
 {
-    let Some(mut conn) = any_test_conn("SQL Server Any prepare test").await? else {
-        return Ok(());
-    };
+    let mut conn = any_test_conn().await?;
 
     let statement = conn
         .prepare(sqlx_core::sql_str::SqlStr::from_static("SELECT 1 AS value"))
@@ -1071,10 +1013,9 @@ async fn any_prepares_statement_metadata_when_configured() -> Result<(), Box<dyn
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn any_fetches_select_one_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = any_test_conn("SQL Server Any query test").await? else {
-        return Ok(());
-    };
+    let mut conn = any_test_conn().await?;
 
     let row = sqlx_core::query::query("SELECT 1")
         .fetch_one(&mut conn)
@@ -1088,10 +1029,9 @@ async fn any_fetches_select_one_when_configured() -> Result<(), Box<dyn std::err
 
 #[cfg(all(feature = "integration-tests", feature = "migrate"))]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn runs_migration_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = native_test_conn("SQL Server migration test").await? else {
-        return Ok(());
-    };
+    let mut conn = native_test_conn().await?;
 
     let table_name = "_sqlx_migrations_smoke";
     let _ = conn
@@ -1145,10 +1085,9 @@ async fn runs_migration_when_configured() -> Result<(), Box<dyn std::error::Erro
 
 #[cfg(all(feature = "integration-tests", feature = "migrate"))]
 #[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn any_runs_migration_when_configured() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mut conn) = any_migrate_test_conn("SQL Server Any migration test").await? else {
-        return Ok(());
-    };
+    let mut conn = any_test_conn().await?;
 
     let table_name = "_sqlx_any_migrations_smoke";
     let _ = conn

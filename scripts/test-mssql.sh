@@ -3,15 +3,19 @@ set -euo pipefail
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
-: "${MSSQL_DATABASE_URL:?set MSSQL_DATABASE_URL to run SQL Server integration tests}"
+if [[ "${MSSQL_DATABASE_URL:-}" != *[![:space:]]* ]]; then
+    echo "set MSSQL_DATABASE_URL to run SQL Server integration tests" >&2
+    exit 1
+fi
 
-cargo test --locked --features integration-tests,runtime-tokio --test mssql_smoke --no-run
+test_args=(--locked --all-features --test mssql_smoke)
+cargo test "${test_args[@]}" --no-run
 
 deadline=$((SECONDS + 120))
 while true
 do
-    output="$(cargo test --locked --features integration-tests,runtime-tokio --test mssql_smoke \
-        connects_and_pings_when_configured -- --exact 2>&1)" && {
+    output="$(cargo test "${test_args[@]}" \
+        connects_and_pings_when_configured -- --exact --ignored 2>&1)" && {
         printf '%s\n' "$output"
         break
     }
@@ -32,4 +36,4 @@ do
     sleep 5
 done
 
-cargo test --locked --features integration-tests,runtime-tokio --test mssql_smoke
+cargo test "${test_args[@]}" -- --include-ignored

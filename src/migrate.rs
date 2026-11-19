@@ -147,7 +147,7 @@ END
 
     fn lock(&mut self) -> BoxFuture<'_, Result<(), MigrateError>> {
         Box::pin(async move {
-            let _: Option<(i32,)> = query_as(
+            let status: i32 = query_scalar(
                 r#"
 DECLARE @result int;
 EXEC @result = sp_getapplock
@@ -158,26 +158,28 @@ EXEC @result = sp_getapplock
 SELECT @result;
                 "#,
             )
-            .fetch_optional(self)
+            .fetch_one(self)
             .await?;
 
-            Ok(())
+            check_lock_status("sp_getapplock", status)
         })
     }
 
     fn unlock(&mut self) -> BoxFuture<'_, Result<(), MigrateError>> {
         Box::pin(async move {
-            query(
+            let status: i32 = query_scalar(
                 r#"
-EXEC sp_releaseapplock
+DECLARE @result int;
+EXEC @result = sp_releaseapplock
     @Resource = N'sqlx-migrate',
     @LockOwner = N'Session';
+SELECT @result;
                 "#,
             )
-            .execute(self)
+            .fetch_one(self)
             .await?;
 
-            Ok(())
+            check_lock_status("sp_releaseapplock", status)
         })
     }
 
@@ -266,7 +268,7 @@ async fn execute_migration(
 ) -> Result<(), MigrateError> {
     conn.execute(migration.sql.clone())
         .await
-        .map_err(|error| revert_execution_error(error, migration.version))?;
+        .map_err(|error| MigrateError::ExecuteMigration(error, migration.version))?;
 
     query(AssertSqlSafe(format!(
         r#"
@@ -302,11 +304,14 @@ async fn revert_migration(
     Ok(())
 }
 
-fn revert_execution_error(error: sqlx_core::Error, version: i64) -> MigrateError {
-    MigrateError::ExecuteMigration(
-        sqlx_core::Error::Protocol(format!("while reverting migration {version}: {error}")),
-        version,
-    )
+fn check_lock_status(procedure: &str, status: i32) -> Result<(), MigrateError> {
+    if status < 0 {
+        return Err(Error::Protocol(format!(
+            "SQL Server migration lock procedure {procedure} returned {status}"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 fn quote_ident(identifier: &str) -> String {
@@ -332,10 +337,12 @@ mod tests {
     }
 
     #[test]
-    fn revert_error_mentions_reverting() {
-        let error = revert_execution_error(sqlx_core::Error::Protocol("boom".into()), 7);
-        let message = error.to_string();
-
-        assert!(message.contains("reverting migration 7"));
+    fn rejects_failed_migration_locks() {
+        assert!(check_lock_status("sp_getapplock", 0).is_ok());
+        assert!(check_lock_status("sp_getapplock", 1).is_ok());
+        assert!(check_lock_status("sp_getapplock", -3)
+            .unwrap_err()
+            .to_string()
+            .contains("sp_getapplock returned -3"));
     }
 }
