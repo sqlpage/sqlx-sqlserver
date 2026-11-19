@@ -107,14 +107,14 @@ pub fn assemble_options(options: &[PreLoginOption]) -> Result<Vec<u8>, PreLoginE
 
 /// Parses a TDS pre-login option table and payload.
 pub fn parse_options(input: &[u8]) -> Result<Vec<PreLoginOption>, PreLoginError> {
-    let terminator = input
-        .iter()
-        .position(|byte| *byte == u8::from(PreLoginOptionToken::Terminator))
-        .ok_or(PreLoginError::MissingTerminator)?;
-
-    if terminator % 5 != 0 {
-        return Err(PreLoginError::TruncatedOptionTable);
-    }
+    let terminator = (0..input.len())
+        .step_by(5)
+        .find(|&index| input[index] == u8::from(PreLoginOptionToken::Terminator))
+        .ok_or(if input.len().is_multiple_of(5) {
+            PreLoginError::MissingTerminator
+        } else {
+            PreLoginError::TruncatedOptionTable
+        })?;
 
     let mut options = Vec::with_capacity(terminator / 5);
 
@@ -345,6 +345,17 @@ mod tests {
             ],
             options
         );
+    }
+
+    #[test]
+    fn accepts_terminator_byte_in_an_option_length() {
+        let options = vec![PreLoginOption {
+            token: PreLoginOptionToken::Instance,
+            data: vec![b'a'; 255],
+        }];
+        let payload = assemble_options(&options).unwrap();
+
+        assert_eq!(options, parse_options(&payload).unwrap());
     }
 
     #[test]

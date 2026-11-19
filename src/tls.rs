@@ -2,6 +2,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
+use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::protocol::packet::{
@@ -16,6 +17,7 @@ pub(crate) struct TlsPreloginStream<S> {
     header_pos: usize,
     read_remaining: usize,
     write_buf: Vec<u8>,
+    pending_write: Bytes,
 }
 
 impl<S> TlsPreloginStream<S> {
@@ -27,6 +29,7 @@ impl<S> TlsPreloginStream<S> {
             header_pos: 0,
             read_remaining: 0,
             write_buf: Vec::new(),
+            pending_write: Bytes::new(),
         }
     }
 
@@ -63,7 +66,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsPreloginStream<S> {
             return Poll::Ready(Ok(()));
         }
 
-        if self.read_remaining == 0 {
+        while self.read_remaining == 0 {
             while self.header_pos < PACKET_HEADER_LEN {
                 let mut scratch = [0; PACKET_HEADER_LEN];
                 let remaining = PACKET_HEADER_LEN - self.header_pos;
@@ -106,7 +109,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsPreloginStream<S> {
         }
 
         let max_read = std::cmp::min(self.read_remaining, buf.remaining());
-        let mut limited_buf = buf.take(max_read);
+        let mut limited_buf = ReadBuf::new(buf.initialize_unfilled_to(max_read));
         ready!(Pin::new(&mut self.stream).poll_read(cx, &mut limited_buf))?;
 
         let read = limited_buf.filled().len();
@@ -138,29 +141,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsPreloginStream<S> {
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.handshake && !self.write_buf.is_empty() {
-            let payload = std::mem::take(&mut self.write_buf);
-            self.write_buf =
-                wrap_prelogin_tls_payload(&payload, 4096).map_err(packet_frame_error)?;
-
-            while !self.write_buf.is_empty() {
-                let write_buf = std::mem::take(&mut self.write_buf);
-                let written = ready!(Pin::new(&mut self.stream).poll_write(cx, &write_buf))?;
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        while !this.pending_write.is_empty() || !this.write_buf.is_empty() {
+            if this.pending_write.is_empty() {
+                this.pending_write = wrap_prelogin_tls_payload(&this.write_buf, 4096)
+                    .map_err(packet_frame_error)?
+                    .into();
+                this.write_buf.clear();
+            }
+            while !this.pending_write.is_empty() {
+                let written =
+                    ready!(Pin::new(&mut this.stream).poll_write(cx, &this.pending_write))?;
                 if written == 0 {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "failed to write TLS handshake packet",
                     )));
                 }
-
-                if written < write_buf.len() {
-                    self.write_buf.extend_from_slice(&write_buf[written..]);
-                }
+                this.pending_write.advance(written);
             }
         }
 
-        Pin::new(&mut self.stream).poll_flush(cx)
+        Pin::new(&mut this.stream).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -189,6 +192,7 @@ fn packet_frame_error(error: PacketFrameError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn wraps_tls_handshake_bytes_as_prelogin_packets() {
@@ -198,5 +202,46 @@ mod tests {
         assert_eq!(PacketType::PRE_LOGIN, header.packet_type);
         assert_eq!(PACKET_HEADER_LEN + 5, usize::from(header.length));
         assert_eq!(b"hello", &packet[PACKET_HEADER_LEN..]);
+    }
+
+    #[tokio::test]
+    async fn preserves_framed_handshake_across_pending_writes() {
+        let (client, mut server) = tokio::io::duplex(5);
+        let mut client = TlsPreloginStream::new(client);
+        client.start_handshake();
+        let packet = wrap_prelogin_tls_payload(b"hello", 4096).unwrap();
+        let mut received = vec![0; packet.len()];
+
+        let (sent, read) = tokio::join!(
+            async {
+                client.write_all(b"hello").await?;
+                client.flush().await?;
+                client.shutdown().await
+            },
+            server.read_exact(&mut received)
+        );
+
+        sent.unwrap();
+        read.unwrap();
+        assert_eq!(packet, received);
+    }
+
+    #[tokio::test]
+    async fn reads_handshake_payload_into_uninitialized_buffer() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let mut client = TlsPreloginStream::new(client);
+        client.start_handshake();
+        server
+            .write_all(&wrap_prelogin_tls_payload(b"hello", 4096).unwrap())
+            .await
+            .unwrap();
+        let mut storage = [std::mem::MaybeUninit::uninit(); 8];
+        let mut buf = ReadBuf::uninit(&mut storage);
+
+        std::future::poll_fn(|cx| Pin::new(&mut client).poll_read(cx, &mut buf))
+            .await
+            .unwrap();
+
+        assert_eq!(b"hello", buf.filled());
     }
 }
