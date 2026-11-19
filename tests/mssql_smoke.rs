@@ -762,6 +762,52 @@ async fn supports_nested_transactions_when_configured() -> Result<(), Box<dyn st
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+async fn nested_rollback_undoes_all_descendant_work() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut conn) = native_test_conn("SQL Server nested rollback boundaries").await? else {
+        return Ok(());
+    };
+
+    conn.execute("CREATE TABLE #sqlx_nested_rollback (id INT NOT NULL PRIMARY KEY)")
+        .await?;
+
+    for drop_nested_scopes in [false, true] {
+        let mut outer = conn.begin().await?;
+        outer
+            .execute("INSERT INTO #sqlx_nested_rollback VALUES (1)")
+            .await?;
+
+        let mut middle = sqlx_core::acquire::Acquire::begin(&mut outer).await?;
+        middle
+            .execute("INSERT INTO #sqlx_nested_rollback VALUES (2)")
+            .await?;
+
+        let mut inner = sqlx_core::acquire::Acquire::begin(&mut middle).await?;
+        inner
+            .execute("INSERT INTO #sqlx_nested_rollback VALUES (3)")
+            .await?;
+
+        if drop_nested_scopes {
+            drop(inner);
+            drop(middle);
+        } else {
+            inner.commit().await?;
+            middle.rollback().await?;
+        }
+
+        let ids: Vec<i32> =
+            sqlx_core::query_scalar::query_scalar("SELECT id FROM #sqlx_nested_rollback")
+                .fetch_all(&mut *outer)
+                .await?;
+        assert_eq!(ids, [1], "drop_nested_scopes={drop_nested_scopes}");
+        outer.rollback().await?;
+    }
+
+    conn.close().await?;
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
 async fn dropped_transaction_rolls_back_on_next_use() -> Result<(), Box<dyn std::error::Error>> {
     let Some(mut conn) = native_test_conn("SQL Server dropped transaction rollback test").await?
     else {
