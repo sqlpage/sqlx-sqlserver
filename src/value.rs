@@ -86,9 +86,7 @@ impl<'r> MssqlValueRef<'r> {
         feature = "bigdecimal",
         feature = "chrono",
         feature = "decimal",
-        feature = "json",
-        feature = "time",
-        feature = "uuid"
+        feature = "time"
     ))]
     pub(crate) fn mssql_type_info(&self) -> &'r MssqlTypeInfo {
         self.type_info
