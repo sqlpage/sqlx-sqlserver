@@ -1,6 +1,7 @@
 use percent_encoding::percent_decode_str;
 use sqlx_core::connection::ConnectOptions;
 use sqlx_core::error::Error;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -23,7 +24,7 @@ pub enum Encrypt {
 }
 
 /// SQL Server connection options.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MssqlConnectOptions {
     host: String,
     port: Option<u16>,
@@ -43,6 +44,31 @@ pub struct MssqlConnectOptions {
     server_name: String,
     client_interface_name: String,
     language: String,
+}
+
+impl fmt::Debug for MssqlConnectOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MssqlConnectOptions")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("database", &self.database)
+            .field("instance", &self.instance)
+            .field("encrypt", &self.encrypt)
+            .field("trust_server_certificate", &self.trust_server_certificate)
+            .field("hostname_in_certificate", &self.hostname_in_certificate)
+            .field("ssl_root_cert", &self.ssl_root_cert)
+            .field("requested_packet_size", &self.requested_packet_size)
+            .field("client_program_version", &self.client_program_version)
+            .field("client_pid", &self.client_pid)
+            .field("hostname", &self.hostname)
+            .field("app_name", &self.app_name)
+            .field("server_name", &self.server_name)
+            .field("client_interface_name", &self.client_interface_name)
+            .field("language", &self.language)
+            .finish()
+    }
 }
 
 impl Default for MssqlConnectOptions {
@@ -372,6 +398,17 @@ pub enum MssqlInvalidOption {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacts_password_from_debug_output() {
+        let options =
+            MssqlConnectOptions::parse_url("mssql://sa:private-password@example.com/database")
+                .unwrap();
+        let debug = format!("{options:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("private-password"));
+    }
 
     #[test]
     fn parses_username_with_at_sign() {
