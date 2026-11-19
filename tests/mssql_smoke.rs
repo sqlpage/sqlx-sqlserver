@@ -962,6 +962,61 @@ async fn inspects_database_errors_when_configured() -> Result<(), Box<dyn std::e
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
 #[ignore = "requires MSSQL_DATABASE_URL"]
+async fn first_row_fetch_reports_later_batch_errors() -> Result<(), Box<dyn std::error::Error>> {
+    let mut native = native_test_conn().await?;
+    let mut any = any_test_conn().await?;
+
+    const SQL: &str = "SELECT 7; RAISERROR('later batch error', 16, 1);";
+    let errors = [
+        native
+            .fetch_optional(SQL)
+            .await
+            .map(|_| ())
+            .expect_err("native fetch should report the batch error"),
+        any.fetch_optional(SQL)
+            .await
+            .map(|_| ())
+            .expect_err("Any fetch should report the batch error"),
+    ];
+
+    for error in errors {
+        assert_eq!(
+            error.as_database_error().unwrap().message(),
+            "later batch error"
+        );
+    }
+
+    native.close().await?;
+    any.close().await?;
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
+async fn first_row_fetch_applies_later_transaction_state() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut conn = native_test_conn().await?;
+
+    let value: i32 =
+        sqlx_core::query_scalar::query_scalar("SELECT 7; BEGIN TRANSACTION; SELECT 8;")
+            .fetch_one(&mut conn)
+            .await?;
+    assert_eq!(value, 7);
+
+    let transaction_count: i32 = sqlx_core::query_scalar::query_scalar("SELECT @@TRANCOUNT")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(transaction_count, 1);
+
+    conn.execute("ROLLBACK TRANSACTION").await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn any_fetches_bound_integer_when_configured() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = any_test_conn().await?;
 
