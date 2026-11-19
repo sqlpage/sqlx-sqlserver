@@ -16,8 +16,9 @@ packet helpers, metadata/type helpers, and argument encoding.
 
 ## Integration tests
 
-Integration tests require `MSSQL_DATABASE_URL`. When the variable is absent, the
-tests print a skip message and pass.
+The standard test harness marks live SQL Server tests as ignored. Run them with
+all optional features enabled by setting `MSSQL_DATABASE_URL` and using the live
+test script.
 
 ```sh
 MSSQL_DATABASE_URL='mssql://sa:Password123!@localhost:1433/master?encrypt=mandatory&trust_server_certificate=true' \
