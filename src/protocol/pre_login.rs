@@ -118,7 +118,7 @@ pub fn parse_options(input: &[u8]) -> Result<Vec<PreLoginOption>, PreLoginError>
 
     let mut options = Vec::with_capacity(terminator / 5);
 
-    for entry in input[..terminator].chunks_exact(5) {
+    for entry in input[..terminator].as_chunks::<5>().0 {
         let token = PreLoginOptionToken::try_from(entry[0])?;
         let offset = usize::from(u16::from_be_bytes([entry[1], entry[2]]));
         let len = usize::from(u16::from_be_bytes([entry[3], entry[4]]));

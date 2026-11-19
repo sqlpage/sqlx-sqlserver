@@ -298,8 +298,11 @@ fn read_utf16_string(input: &mut &[u8], len_chars: usize) -> Result<String, Toke
         .ok_or(TokenParseError::LengthOverflow)?;
     let bytes = take(input, len_bytes)?;
     let units = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_le_bytes);
 
     String::from_utf16(&units.collect::<Vec<_>>()).map_err(|_| TokenParseError::InvalidUtf16)
 }

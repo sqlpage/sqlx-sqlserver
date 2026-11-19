@@ -37,8 +37,11 @@ pub(crate) fn read_utf16(input: &mut &[u8], len_chars: usize) -> Result<String, 
         .ok_or_else(|| Error::Protocol("SQL Server string length overflow".to_owned()))?;
     let bytes = take(input, len_bytes)?;
     let units = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_le_bytes)
         .collect::<Vec<_>>();
 
     String::from_utf16(&units)
