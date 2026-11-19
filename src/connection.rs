@@ -720,7 +720,7 @@ fn negotiate_encryption(requested: Encrypt, server: Encrypt) -> std::result::Res
             "SQL Server TLS encryption is required but not supported by the server".into(),
         )),
         (Encrypt::On | Encrypt::Required, Encrypt::On | Encrypt::Required) => Ok(true),
-        (Encrypt::Off, _) | (_, Encrypt::Off) => Err(Error::Protocol(
+        (Encrypt::Off, _) => Err(Error::Protocol(
             "SQL Server login-only TLS fallback is not implemented yet; use encrypt=mandatory for encrypted connections, or encrypt=not_supported for plaintext development servers"
                 .to_owned(),
         )),
