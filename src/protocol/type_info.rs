@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use super::read::{consume, read_u16_le, read_u32_le, read_u64_le, read_u8, take, ReadError};
+use super::read::{consume, read_u16_le, read_u32_le, read_u64_le, read_u8, ReadError};
 use bytes::{Buf, Bytes};
 use sqlx_core::encode::{Encode, IsNull};
 use sqlx_core::error::BoxDynError;
@@ -377,6 +377,7 @@ impl TypeInfo {
                         PLP_NULL => ValueLength::Null,
                         declared => ValueLength::Plp {
                             declared,
+                            chunk_remaining: 0,
                             data: Vec::new(),
                         },
                     }
@@ -728,12 +729,16 @@ impl TypeInfo {
 }
 
 /// The length prefix is read once. A partially length-prefixed (PLP) value
-/// keeps its completed chunks while the next TDS packet arrives.
+/// is assembled directly from packet data, even when a chunk spans packets.
 #[derive(Debug)]
 pub(crate) enum ValueLength {
     Null,
     Bytes(usize),
-    Plp { declared: u64, data: Vec<u8> },
+    Plp {
+        declared: u64,
+        chunk_remaining: usize,
+        data: Vec<u8>,
+    },
 }
 
 impl ValueLength {
@@ -754,14 +759,21 @@ impl ValueLength {
                 }
                 Some(input.split_to(*len))
             }
-            Self::Plp { declared, data } => {
+            Self::Plp {
+                declared,
+                chunk_remaining,
+                data,
+            } => {
                 loop {
-                    let mut chunk = input.as_ref();
-                    let size = read_u32_le(&mut chunk)? as usize;
-                    let bytes = take(&mut chunk, size)?;
-                    data.extend_from_slice(bytes);
-                    input.advance(4 + size);
-                    if size == 0 {
+                    let available = (*chunk_remaining).min(input.len());
+                    data.extend_from_slice(&input[..available]);
+                    input.advance(available);
+                    *chunk_remaining -= available;
+                    if *chunk_remaining > 0 {
+                        return Err(ReadError::UnexpectedEof);
+                    }
+                    *chunk_remaining = consume(input, read_u32_le)? as usize;
+                    if *chunk_remaining == 0 {
                         break;
                     }
                 }
@@ -919,6 +931,7 @@ impl Collation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::read::take;
 
     #[test]
     fn parses_type_info_and_value_with_old_wire_constants() {

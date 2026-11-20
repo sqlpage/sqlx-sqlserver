@@ -353,8 +353,11 @@ mod tests {
                     _ => (),
                 }
             }
-            // Finished PLP chunks have already been consumed.
-            assert!(events.payload.len() < 4 + 67);
+            // Within a row, even the largest PLP chunk only leaves a partial
+            // length prefix in the packet buffer.
+            if matches!(events.partial, Some(PartialToken::Row(_))) {
+                assert!(events.payload.len() < 8);
+            }
         }
         events.finish().unwrap();
         assert_eq!(rows.len(), 1);
