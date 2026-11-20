@@ -25,15 +25,6 @@ const TOKEN_DONEPROC: u8 = 0xfe;
 const TOKEN_DONEINPROC: u8 = 0xff;
 
 #[derive(Debug)]
-pub(crate) struct QueryOutput {
-    pub(crate) columns: Vec<MssqlColumn>,
-    #[allow(dead_code)]
-    pub(crate) result: MssqlQueryResult,
-    pub(crate) return_values: Vec<MssqlValue>,
-    pub(crate) env_changes: Vec<EnvChange>,
-}
-
-#[derive(Debug)]
 pub(crate) enum QueryEvent {
     Columns(Vec<MssqlColumn>),
     Row(MssqlRow),
@@ -57,7 +48,8 @@ pub(crate) struct QueryEvents {
 }
 
 impl QueryEvents {
-    pub(crate) fn new(payload: impl Into<Bytes>) -> Self {
+    #[cfg(test)]
+    fn new(payload: impl Into<Bytes>) -> Self {
         let mut events = Self::default();
         events.push_packet(payload.into());
         events
@@ -79,18 +71,6 @@ impl QueryEvents {
             return Err(Error::Protocol(ReadError::UnexpectedEof.to_string()));
         }
         Ok(())
-    }
-
-    /// Decode a buffered, complete message and stop after its first error.
-    pub(crate) fn next_in_message(&mut self) -> Result<Option<QueryEvent>, Error> {
-        let result = match self.next() {
-            Ok(None) => self.finish().map(|()| None),
-            other => other,
-        };
-        if result.is_err() {
-            *self = Self::default();
-        }
-        result
     }
 
     pub(crate) fn next(&mut self) -> Result<Option<QueryEvent>, Error> {
@@ -187,31 +167,6 @@ pub(crate) fn build_sql_batch_packet(
     encode_message(PacketType::SQL_BATCH, &payload, packet_size)
 }
 
-pub(crate) fn parse_query_response(input: &[u8]) -> Result<QueryOutput, Error> {
-    let mut events = QueryEvents::new(Bytes::copy_from_slice(input));
-    let mut columns = Vec::new();
-    let mut return_values = Vec::new();
-    let mut env_changes = Vec::new();
-    let mut rows_affected = 0;
-
-    while let Some(event) = events.next_in_message()? {
-        match event {
-            QueryEvent::Columns(new_columns) => columns = new_columns,
-            QueryEvent::Row(_) => {}
-            QueryEvent::Result(result) => rows_affected += result.rows_affected(),
-            QueryEvent::ReturnValue(value) => return_values.push(value),
-            QueryEvent::EnvChange(env_change) => env_changes.push(env_change),
-        }
-    }
-
-    Ok(QueryOutput {
-        columns,
-        result: MssqlQueryResult::new(rows_affected),
-        return_values,
-        env_changes,
-    })
-}
-
 pub(crate) fn write_all_headers(out: &mut Vec<u8>, transaction_descriptor: u64) {
     out.extend_from_slice(&22_u32.to_le_bytes());
     out.extend_from_slice(&18_u32.to_le_bytes());
@@ -257,12 +212,14 @@ mod tests {
     #[test]
     fn parses_select_one_response() {
         let response = [col_metadata_int(""), row_int(1), done(0x10, 0, 1)].concat();
-        let output = parse_query_response(&response).unwrap();
-        let rows = parse_rows(&response);
-
-        assert_eq!(1, rows.len());
-        assert_eq!(1, output.result.rows_affected());
-        assert_eq!(1_i32, rows[0].try_get::<i32, _>(0).unwrap());
+        let events = parse_events(response).unwrap();
+        let [QueryEvent::Columns(_), QueryEvent::Row(row), QueryEvent::Result(result)] =
+            &events[..]
+        else {
+            panic!("unexpected SELECT response: {events:?}");
+        };
+        assert_eq!(1, result.rows_affected());
+        assert_eq!(1_i32, row.try_get::<i32, _>(0).unwrap());
     }
 
     #[test]
@@ -307,13 +264,13 @@ mod tests {
     #[test]
     fn parses_return_value_response() {
         let response = [return_status(0), return_value_int(42), done(0x10, 0, 1)].concat();
-        let output = parse_query_response(&response).unwrap();
-
-        assert_eq!(1, output.return_values.len());
+        let events = parse_events(response).unwrap();
+        let [QueryEvent::ReturnValue(value), QueryEvent::Result(_)] = &events[..] else {
+            panic!("unexpected RPC response: {events:?}");
+        };
         assert_eq!(
             42_i32,
-            <i32 as sqlx_core::decode::Decode<Mssql>>::decode(output.return_values[0].as_ref())
-                .unwrap()
+            <i32 as sqlx_core::decode::Decode<Mssql>>::decode(value.as_ref()).unwrap()
         );
     }
 
@@ -325,21 +282,19 @@ mod tests {
             done(0, 0, 0),
         ]
         .concat();
-        let output = parse_query_response(&response).unwrap();
-
-        assert_eq!(
-            output.env_changes,
-            vec![
-                EnvChange::PacketSize(8192),
-                EnvChange::BeginTransaction(0x0102_0304_0506_0708)
+        assert!(matches!(
+            parse_events(response).unwrap().as_slice(),
+            [
+                QueryEvent::EnvChange(EnvChange::PacketSize(8192)),
+                QueryEvent::EnvChange(EnvChange::BeginTransaction(0x0102_0304_0506_0708))
             ]
-        );
+        ));
     }
 
     #[test]
     fn parses_error_token_as_database_error() {
         let response = [error(208, 1, 16, "Invalid object name", "dbhost", "", 3)].concat();
-        let error = parse_query_response(&response).unwrap_err();
+        let error = parse_events(response).unwrap_err();
         let db_error = error.as_database_error().unwrap();
         let mssql_error = db_error
             .as_error()
@@ -353,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn ends_query_events_after_an_error() {
+    fn reads_end_of_batch_after_an_error() {
         let response = [
             error(208, 1, 16, "Invalid object name", "dbhost", "", 3),
             done(0, 0, 0),
@@ -361,8 +316,8 @@ mod tests {
         .concat();
         let mut events = QueryEvents::new(response);
 
-        assert!(matches!(events.next_in_message(), Err(Error::Database(_))));
-        assert!(events.next_in_message().unwrap().is_none());
+        assert!(matches!(events.next(), Err(Error::Database(_))));
+        assert!(events.next().unwrap().is_none());
     }
 
     #[test]
@@ -571,17 +526,25 @@ mod tests {
         out
     }
 
-    fn parse_rows(response: &[u8]) -> Vec<MssqlRow> {
-        let mut events = QueryEvents::new(response.to_vec());
-        let mut rows = Vec::new();
-
-        while let Some(event) = events.next_in_message().unwrap() {
-            if let QueryEvent::Row(row) = event {
-                rows.push(row);
-            }
+    fn parse_events(response: Vec<u8>) -> Result<Vec<QueryEvent>, Error> {
+        let mut decoder = QueryEvents::new(response);
+        let mut events = Vec::new();
+        while let Some(event) = decoder.next()? {
+            events.push(event);
         }
+        decoder.finish()?;
+        Ok(events)
+    }
 
-        rows
+    fn parse_rows(response: &[u8]) -> Vec<MssqlRow> {
+        parse_events(response.to_vec())
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event {
+                QueryEvent::Row(row) => Some(row),
+                _ => None,
+            })
+            .collect()
     }
 
     fn done(status: u16, current_command: u16, row_count: u64) -> Vec<u8> {

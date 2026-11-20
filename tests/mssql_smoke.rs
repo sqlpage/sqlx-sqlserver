@@ -202,6 +202,67 @@ async fn fetches_1000_rows_when_configured() -> Result<(), Box<dyn std::error::E
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
 #[ignore = "requires MSSQL_DATABASE_URL"]
+async fn streams_a_row_while_the_batch_is_blocked() -> Result<(), Box<dyn std::error::Error>> {
+    let mut gate = native_test_conn().await?;
+    let mut conn = native_test_conn().await?;
+    let lock: String = sqlx_core::query_scalar::query_scalar(
+        "DECLARE @lock nvarchar(255) = CONCAT('sqlx-row-stream-', @@SPID);
+         EXEC sp_getapplock @Resource=@lock, @LockMode='Exclusive', @LockOwner='Session';
+         SELECT @lock",
+    )
+    .fetch_one(&mut gate)
+    .await?;
+
+    // Flush a row spanning several TDS packets, then wait for the reader to release the lock.
+    let mut rows = sqlx_core::query::query(
+        "SELECT REPLICATE(CAST(N'x' AS nvarchar(max)), 50000);
+         RAISERROR ('flush first row', 0, 1) WITH NOWAIT;
+         EXEC sp_getapplock @Resource=@p1, @LockMode='Shared', @LockOwner='Session';
+         SELECT N'finished'",
+    )
+    .bind(lock.as_str())
+    .fetch(&mut conn);
+    let row = tokio::time::timeout(Duration::from_secs(5), rows.try_next())
+        .await
+        .expect("the first row should arrive while SQL Server is waiting for the lock")?
+        .expect("first row");
+    assert_eq!(row.try_get::<String, _>(0)?, "x".repeat(50_000));
+
+    gate.close().await?;
+    let row = rows.try_next().await?.expect("row after lock release");
+    assert_eq!(row.try_get::<String, _>(0)?, "finished");
+    assert!(rows.try_next().await?.is_none());
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
+async fn reuses_the_connection_after_dropping_a_row_stream(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = native_test_conn().await?;
+    let mut rows = sqlx_core::query::query(
+        "SELECT CAST(@@SPID AS int);
+         SELECT REPLICATE(CAST(N'x' AS nvarchar(max)), 50000);
+         RAISERROR ('discarded row stream', 16, 1);
+         BEGIN TRANSACTION",
+    )
+    .fetch(&mut conn);
+    let session: i32 = rows.try_next().await?.expect("first row").try_get(0)?;
+    drop(rows);
+
+    let row =
+        sqlx_core::query::query("SELECT CAST(@@SPID AS int), @@TRANCOUNT; ROLLBACK TRANSACTION")
+            .fetch_one(&mut conn)
+            .await?;
+    assert_eq!(row.try_get::<i32, _>(0)?, session);
+    assert_eq!(row.try_get::<i32, _>(1)?, 1);
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
+#[ignore = "requires MSSQL_DATABASE_URL"]
 async fn execute_reports_rows_affected_when_configured() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = native_test_conn().await?;
 

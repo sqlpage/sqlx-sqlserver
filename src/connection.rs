@@ -1,17 +1,16 @@
 use futures_core::future::BoxFuture;
-use futures_core::stream::{BoxStream, Stream};
-use futures_util::{future, stream, StreamExt, TryStreamExt};
+use futures_core::stream::BoxStream;
+use futures_util::{StreamExt, TryStreamExt};
 use native_tls::Certificate;
 use sqlx_core::connection::Connection;
 use sqlx_core::decode::Decode;
 use sqlx_core::error::Error;
 use sqlx_core::executor::{Execute, Executor};
+use sqlx_core::ext::async_stream::TryAsyncStream;
 use sqlx_core::sql_str::SqlStr;
 use sqlx_core::transaction::Transaction;
 use sqlx_core::value::Value;
 use sqlx_core::Either;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsConnector;
@@ -20,23 +19,22 @@ use crate::error::server_error;
 use crate::protocol::login::build_login7_packet;
 use crate::protocol::packet::{PacketHeader, PacketType, PACKET_HEADER_LEN};
 use crate::protocol::pre_login::{build_pre_login_packet, parse_server_encrypt};
-use crate::protocol::query::{
-    build_sql_batch_packet, parse_query_response, QueryEvent, QueryEvents, QueryOutput,
-};
+use crate::protocol::query::{build_sql_batch_packet, QueryEvent, QueryEvents};
 use crate::protocol::rpc::{
     build_execute_sql_packet, build_prepare_packet, build_unprepare_packet,
 };
 use crate::protocol::token::{parse_login_response, EnvChange, LoginResponse};
 use crate::tls::TlsPreloginStream;
 use crate::{
-    ssrp, Encrypt, Mssql, MssqlArguments, MssqlConnectOptions, MssqlQueryResult, MssqlRow,
-    MssqlStatement, MssqlTypeInfo,
+    ssrp, Encrypt, Mssql, MssqlArguments, MssqlColumn, MssqlConnectOptions, MssqlQueryResult,
+    MssqlRow, MssqlStatement, MssqlTypeInfo,
 };
 
 /// SQL Server connection.
 #[derive(Debug)]
 pub struct MssqlConnection {
     stream: Option<MssqlWireStream>,
+    response: Option<QueryResponse>,
     transaction_depth: usize,
     transaction_descriptor: u64,
     pending_rollback_sql: Option<&'static str>,
@@ -94,6 +92,7 @@ impl MssqlConnection {
             LoginResponse::Success { env_changes, .. } => {
                 let mut conn = Self {
                     stream: Some(stream),
+                    response: None,
                     transaction_depth: 0,
                     transaction_descriptor: 0,
                     pending_rollback_sql: None,
@@ -152,15 +151,16 @@ impl MssqlConnection {
         self.transaction_depth = 0;
     }
 
-    pub(crate) async fn run_sql_batch(&mut self, sql: &str) -> Result<QueryOutput, Error> {
-        self.flush_pending_rollback().await?;
+    pub(crate) async fn run_sql_batch(&mut self, sql: &str) -> Result<(), Error> {
+        self.flush().await?;
         self.run_sql_batch_direct(sql).await
     }
 
-    async fn run_sql_batch_direct(&mut self, sql: &str) -> Result<QueryOutput, Error> {
+    async fn run_sql_batch_direct(&mut self, sql: &str) -> Result<(), Error> {
         let packet = build_sql_batch_packet(sql, self.packet_size()?, self.transaction_descriptor)
             .map_err(frame_error)?;
-        self.read_query_response(&packet, "SQL batch").await
+        self.start_response(&packet, "SQL batch").await?;
+        self.finish_response().await
     }
 
     pub(crate) fn queue_rollback(&mut self) {
@@ -179,21 +179,12 @@ impl MssqlConnection {
         self.pending_rollback_sql = Some(sql);
     }
 
-    async fn flush_pending_rollback(&mut self) -> Result<(), Error> {
-        let Some(sql) = self.pending_rollback_sql.take() else {
-            return Ok(());
-        };
-
-        self.run_sql_batch_direct(sql).await?;
-        Ok(())
-    }
-
-    async fn run_execute_sql_events(
+    async fn start_query(
         &mut self,
         sql: &str,
         arguments: Option<&MssqlArguments>,
-    ) -> Result<QueryEvents, Error> {
-        self.flush_pending_rollback().await?;
+    ) -> Result<(), Error> {
+        self.flush().await?;
 
         let packet_size = self.packet_size()?;
         let transaction_descriptor = self.transaction_descriptor;
@@ -213,16 +204,15 @@ impl MssqlConnection {
             }
         };
 
-        let payload = self.exchange(&packet, operation).await?;
-        Ok(QueryEvents::new(payload))
+        self.start_response(&packet, operation).await
     }
 
     pub(crate) async fn run_prepare(
         &mut self,
         sql: &str,
         parameters: &[MssqlTypeInfo],
-    ) -> Result<QueryOutput, Error> {
-        self.flush_pending_rollback().await?;
+    ) -> Result<Vec<MssqlColumn>, Error> {
+        self.flush().await?;
 
         let packet = build_prepare_packet(
             sql,
@@ -233,9 +223,26 @@ impl MssqlConnection {
         .map_err(|error| {
             Error::Protocol(format!("failed to encode SQL Server prepare RPC: {error}"))
         })?;
-        let output = self.read_query_response(&packet, "prepare RPC").await?;
+        self.start_response(&packet, "prepare RPC").await?;
 
-        if let Some(statement_id) = first_i32_return_value(&output)? {
+        let mut columns = Vec::new();
+        let mut statement_id = None;
+        while let Some(event) = self.next_event().await? {
+            match event {
+                QueryEvent::Columns(metadata) => columns = metadata,
+                QueryEvent::ReturnValue(value) if statement_id.is_none() => {
+                    statement_id = Some(<i32 as Decode<Mssql>>::decode(value.as_ref()).map_err(
+                        |source| Error::ColumnDecode {
+                            index: "return value".to_owned(),
+                            source,
+                        },
+                    )?);
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(statement_id) = statement_id {
             let packet = build_unprepare_packet(
                 statement_id,
                 self.packet_size()?,
@@ -246,10 +253,11 @@ impl MssqlConnection {
                     "failed to encode SQL Server unprepare RPC: {error}"
                 ))
             })?;
-            self.read_query_response(&packet, "unprepare RPC").await?;
+            self.start_response(&packet, "unprepare RPC").await?;
+            self.finish_response().await?;
         }
 
-        Ok(output)
+        Ok(columns)
     }
 
     fn packet_size(&self) -> Result<usize, Error> {
@@ -259,40 +267,50 @@ impl MssqlConnection {
             .ok_or_else(stream_unavailable)
     }
 
-    async fn read_query_response(
+    async fn start_response(
         &mut self,
         packet: &[u8],
         operation: &'static str,
-    ) -> Result<QueryOutput, Error> {
-        let payload = self.exchange(packet, operation).await?;
-        let output = parse_query_response(&payload).map_err(|error| {
-            Error::Protocol(format!(
-                "failed to parse SQL Server {operation} response: {error}"
-            ))
-        })?;
-        self.apply_env_changes(&output.env_changes);
-        Ok(output)
-    }
-
-    async fn exchange(&mut self, packet: &[u8], operation: &'static str) -> Result<Vec<u8>, Error> {
-        // Dropping an in-flight exchange closes the socket. The next request cannot
-        // safely reuse it after a partial write or an unread reply.
-        let mut stream = self.stream.take().ok_or_else(stream_unavailable)?;
-        stream.write_all(packet).await.map_err(|error| {
+    ) -> Result<(), Error> {
+        // A cancelled write or partial packet read leaves the socket out of sync.
+        let mut wire = self.stream.take().ok_or_else(stream_unavailable)?;
+        wire.write_all(packet).await.map_err(|error| {
             context_error(
                 format!("failed to send SQL Server {operation} packet"),
                 error,
             )
         })?;
-        let response = stream.read_message().await.map_err(|error| {
-            context_error(
-                format!("failed to read SQL Server {operation} response"),
-                error,
-            )
-        })?;
+        let mut response = QueryResponse {
+            operation,
+            events: QueryEvents::default(),
+            next_packet_id: None,
+        };
+        self.stream = Some(wire);
+        response.read_packet(&mut self.stream).await?;
+        self.response = Some(response);
+        Ok(())
+    }
 
-        self.stream = Some(stream);
-        Ok(response)
+    async fn next_event(&mut self) -> Result<Option<QueryEvent>, Error> {
+        let Some(response) = &mut self.response else {
+            return Ok(None);
+        };
+        let event = response.next(&mut self.stream).await;
+        match &event {
+            Ok(Some(QueryEvent::EnvChange(change))) => self.apply_env_change(change),
+            Ok(None) => self.response = None,
+            Ok(Some(_)) | Err(Error::Database(_)) => {}
+            Err(_) => {
+                self.stream = None;
+                self.response = None;
+            }
+        }
+        event
+    }
+
+    async fn finish_response(&mut self) -> Result<(), Error> {
+        while self.next_event().await?.is_some() {}
+        Ok(())
     }
 
     pub(crate) fn fetch_many_sql<'e>(
@@ -300,18 +318,17 @@ impl MssqlConnection {
         sql: SqlStr,
         arguments: Result<Option<MssqlArguments>, Error>,
     ) -> BoxStream<'e, Result<Either<MssqlQueryResult, MssqlRow>, Error>> {
-        stream::once(async move {
-            let arguments = arguments?;
-            let events = self
-                .run_execute_sql_events(sql.as_str(), arguments.as_ref())
-                .await?;
-            Ok((self, events))
+        TryAsyncStream::new(move |rows| async move {
+            self.start_query(sql.as_str(), arguments?.as_ref()).await?;
+            while let Some(event) = self.next_event().await? {
+                match event {
+                    QueryEvent::Row(row) => rows.r#yield(Either::Right(row)).await,
+                    QueryEvent::Result(result) => rows.r#yield(Either::Left(result)).await,
+                    _ => {}
+                }
+            }
+            Ok(())
         })
-        .map(|result| match result {
-            Ok((conn, events)) => QueryEventStream { conn, events }.boxed(),
-            Err(error) => stream::once(future::ready(Err(error))).boxed(),
-        })
-        .flatten()
         .boxed()
     }
 
@@ -340,7 +357,9 @@ impl Connection for MssqlConnection {
     type Options = MssqlConnectOptions;
 
     async fn close(mut self) -> Result<(), Error> {
-        self.flush_pending_rollback().await?;
+        if self.pending_rollback_sql.is_some() {
+            self.flush().await?;
+        }
 
         if let Some(mut stream) = self.stream.take() {
             stream.shutdown().await?;
@@ -372,11 +391,23 @@ impl Connection for MssqlConnection {
     fn shrink_buffers(&mut self) {}
 
     async fn flush(&mut self) -> Result<(), Error> {
+        // If the caller dropped a row stream, consume its remaining tokens
+        // before encoding a new request with this session's transaction descriptor.
+        loop {
+            match self.next_event().await {
+                Ok(None) => break,
+                Ok(Some(_)) | Err(Error::Database(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(sql) = self.pending_rollback_sql.take() {
+            self.run_sql_batch_direct(sql).await?;
+        }
         Ok(())
     }
 
     fn should_flush(&self) -> bool {
-        false
+        self.response.is_some() || self.pending_rollback_sql.is_some()
     }
 }
 
@@ -421,33 +452,16 @@ impl<'c> Executor<'c> for &'c mut MssqlConnection {
         'c: 'e,
     {
         Box::pin(async move {
-            let output = self.run_prepare(sql.as_str(), parameters).await?;
+            let columns = self.run_prepare(sql.as_str(), parameters).await?;
             let parameters = if parameters.is_empty() {
                 None
             } else {
                 Some(Either::Left(parameters.to_vec()))
             };
 
-            Ok(MssqlStatement::with_parameters(
-                sql,
-                output.columns,
-                parameters,
-            ))
+            Ok(MssqlStatement::with_parameters(sql, columns, parameters))
         })
     }
-}
-
-fn first_i32_return_value(output: &QueryOutput) -> Result<Option<i32>, Error> {
-    output
-        .return_values
-        .first()
-        .map(|value| {
-            <i32 as Decode<Mssql>>::decode(value.as_ref()).map_err(|error| Error::ColumnDecode {
-                index: "return value".to_owned(),
-                source: error,
-            })
-        })
-        .transpose()
 }
 
 fn stream_unavailable() -> Error {
@@ -750,28 +764,45 @@ fn context_error(context: impl Into<String>, error: Error) -> Error {
     }
 }
 
-struct QueryEventStream<'c> {
-    conn: &'c mut MssqlConnection,
+#[derive(Debug)]
+struct QueryResponse {
+    operation: &'static str,
     events: QueryEvents,
+    next_packet_id: Option<u8>,
 }
 
-impl Stream for QueryEventStream<'_> {
-    type Item = Result<Either<MssqlQueryResult, MssqlRow>, Error>;
+impl QueryResponse {
+    async fn read_packet(&mut self, socket: &mut Option<MssqlWireStream>) -> Result<(), Error> {
+        // read_exact may have consumed part of a packet if this future is cancelled.
+        let mut wire = socket.take().ok_or_else(stream_unavailable)?;
+        let (header, payload) = wire
+            .read_packet(self.next_packet_id)
+            .await
+            .map_err(|error| {
+                context_error(
+                    format!("failed to read SQL Server {} response", self.operation),
+                    error,
+                )
+            })?;
+        *socket = Some(wire);
+        self.events.push_packet(payload.into());
+        self.next_packet_id = header.next_packet_id();
+        Ok(())
+    }
 
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    async fn next(
+        &mut self,
+        wire: &mut Option<MssqlWireStream>,
+    ) -> Result<Option<QueryEvent>, Error> {
         loop {
-            match self.events.next_in_message() {
-                Ok(Some(QueryEvent::Columns(_))) | Ok(Some(QueryEvent::ReturnValue(_))) => {}
-                Ok(Some(QueryEvent::EnvChange(env_change))) => {
-                    self.conn.apply_env_change(&env_change);
-                }
-                Ok(Some(QueryEvent::Row(row))) => return Poll::Ready(Some(Ok(Either::Right(row)))),
-                Ok(Some(QueryEvent::Result(result))) => {
-                    return Poll::Ready(Some(Ok(Either::Left(result))));
-                }
-                Ok(None) => return Poll::Ready(None),
-                Err(error) => return Poll::Ready(Some(Err(error))),
+            if let Some(event) = self.events.next()? {
+                return Ok(Some(event));
             }
+            if self.next_packet_id.is_none() {
+                self.events.finish()?;
+                return Ok(None);
+            }
+            self.read_packet(wire).await?;
         }
     }
 }
@@ -862,6 +893,7 @@ mod tests {
                 stream: MssqlStream::Raw(client.unwrap()),
                 packet_size: 4096,
             }),
+            response: None,
             transaction_depth: 0,
             transaction_descriptor: 0,
             pending_rollback_sql: None,

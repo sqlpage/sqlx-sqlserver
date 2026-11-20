@@ -141,10 +141,10 @@ impl AnyConnectionBackend for MssqlConnection {
 
         Box::pin(async move {
             let parameters = parameters?;
-            let statement = self.run_prepare(sql.as_str(), &parameters).await?;
+            let columns = self.run_prepare(sql.as_str(), &parameters).await?;
             let statement = crate::MssqlStatement::with_parameters(
                 sql,
-                statement.columns,
+                columns,
                 if parameters.is_empty() {
                     None
                 } else {
