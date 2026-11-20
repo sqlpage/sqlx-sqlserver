@@ -86,6 +86,12 @@ impl PacketHeader {
         }
     }
 
+    /// Returns the next packet ID, or None at the end of the message.
+    pub(crate) fn next_packet_id(self) -> Option<u8> {
+        (self.status.code() & PacketStatus::END_OF_MESSAGE.code() == 0)
+            .then(|| self.packet_id.wrapping_add(1))
+    }
+
     /// Encodes this header to its wire representation.
     pub fn encode(self) -> [u8; PACKET_HEADER_LEN] {
         let length = self.length.to_be_bytes();
@@ -249,9 +255,9 @@ pub fn try_decode_message(input: &[u8]) -> Result<Option<PacketMessage>, PacketF
             .map_err(|_| PacketFrameError::MessageTooLarge)?;
         payload.extend_from_slice(packet);
         offset = packet_end;
-        expected_packet_id = Some(header.packet_id.wrapping_add(1));
+        expected_packet_id = header.next_packet_id();
 
-        if header.status == PacketStatus::END_OF_MESSAGE {
+        if expected_packet_id.is_none() {
             return Ok(Some(PacketMessage {
                 packet_type: packet_type.expect("packet_type is set after decoding a header"),
                 payload,

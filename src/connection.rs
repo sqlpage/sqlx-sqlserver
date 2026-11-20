@@ -18,7 +18,7 @@ use tokio_native_tls::TlsConnector;
 
 use crate::error::server_error;
 use crate::protocol::login::build_login7_packet;
-use crate::protocol::packet::{PacketHeader, PacketStatus, PacketType, PACKET_HEADER_LEN};
+use crate::protocol::packet::{PacketHeader, PacketType, PACKET_HEADER_LEN};
 use crate::protocol::pre_login::{build_pre_login_packet, parse_server_encrypt};
 use crate::protocol::query::{
     build_sql_batch_packet, parse_query_response, QueryEvent, QueryEvents, QueryOutput,
@@ -61,19 +61,12 @@ impl MssqlConnection {
             .read_message()
             .await
             .map_err(|error| context_error("failed to read SQL Server PRELOGIN response", error))?;
-        if pre_login_response.packet_type != PacketType::TABULAR_RESULT {
-            return Err(Error::Protocol(format!(
-                "expected SQL Server PRELOGIN response as tabular result, got packet type 0x{:02x}",
-                pre_login_response.packet_type.code()
-            )));
-        }
 
-        let server_encrypt =
-            parse_server_encrypt(&pre_login_response.payload).map_err(|error| {
-                Error::Protocol(format!(
-                    "failed to parse SQL Server PRELOGIN response: {error}"
-                ))
-            })?;
+        let server_encrypt = parse_server_encrypt(&pre_login_response).map_err(|error| {
+            Error::Protocol(format!(
+                "failed to parse SQL Server PRELOGIN response: {error}"
+            ))
+        })?;
         let encrypted = negotiate_encryption(options.encrypt(), server_encrypt)?;
 
         if encrypted {
@@ -92,14 +85,8 @@ impl MssqlConnection {
             .read_message()
             .await
             .map_err(|error| context_error("failed to read SQL Server LOGIN7 response", error))?;
-        if login_response.packet_type != PacketType::TABULAR_RESULT {
-            return Err(Error::Protocol(format!(
-                "expected SQL Server LOGIN7 response as tabular result, got packet type 0x{:02x}",
-                login_response.packet_type.code()
-            )));
-        }
 
-        match parse_login_response(&login_response.payload).map_err(|error| {
+        match parse_login_response(&login_response).map_err(|error| {
             Error::Protocol(format!(
                 "failed to parse SQL Server LOGIN7 response: {error}"
             ))
@@ -303,15 +290,9 @@ impl MssqlConnection {
                 error,
             )
         })?;
-        if response.packet_type != PacketType::TABULAR_RESULT {
-            return Err(Error::Protocol(format!(
-                "expected SQL Server query response as tabular result, got packet type 0x{:02x}",
-                response.packet_type.code()
-            )));
-        }
 
         self.stream = Some(stream);
-        Ok(response.payload)
+        Ok(response)
     }
 
     pub(crate) fn fetch_many_sql<'e>(
@@ -581,61 +562,51 @@ impl MssqlWireStream {
         Ok(())
     }
 
-    async fn read_message(&mut self) -> Result<WireMessage, Error> {
-        let mut packet_type = None;
-        let mut expected_packet_id = None;
-        let mut payload = Vec::new();
-
+    async fn read_message(&mut self) -> Result<Vec<u8>, Error> {
+        let mut expected_id = None;
+        let mut message = Vec::new();
         loop {
-            let mut header_bytes = [0u8; PACKET_HEADER_LEN];
-            self.read_exact(&mut header_bytes).await?;
-            let header = PacketHeader::decode(&header_bytes).map_err(packet_error)?;
-
-            if let Some(packet_type) = packet_type {
-                if header.packet_type != packet_type {
-                    return Err(Error::Protocol(format!(
-                        "mismatched SQL Server packet type: expected 0x{:02x}, got 0x{:02x}",
-                        packet_type.code(),
-                        header.packet_type.code()
-                    )));
-                }
-            } else {
-                packet_type = Some(header.packet_type);
-            }
-
-            if let Some(packet_id) = expected_packet_id {
-                if header.packet_id != packet_id {
-                    return Err(Error::Protocol(format!(
-                        "non-contiguous SQL Server packet id: expected {packet_id}, got {}",
-                        header.packet_id
-                    )));
-                }
-            }
-
-            let packet_len = usize::from(header.length);
-            if packet_len > self.packet_size {
-                return Err(Error::Protocol(format!(
-                    "SQL Server packet length {packet_len} exceeds negotiated packet size {}",
-                    self.packet_size
-                )));
-            }
-
-            let payload_len = packet_len.checked_sub(PACKET_HEADER_LEN).ok_or_else(|| {
-                Error::Protocol("SQL Server packet header length underflow".to_owned())
-            })?;
-            let old_len = payload.len();
-            payload.resize(old_len + payload_len, 0);
-            self.read_exact(&mut payload[old_len..]).await?;
-
-            expected_packet_id = Some(header.packet_id.wrapping_add(1));
-
-            if header.status == PacketStatus::END_OF_MESSAGE {
-                return Ok(WireMessage {
-                    packet_type: packet_type.expect("packet_type is set after first header"),
-                    payload,
-                });
+            let (header, payload) = self.read_packet(expected_id).await?;
+            message.extend_from_slice(&payload);
+            expected_id = header.next_packet_id();
+            if expected_id.is_none() {
+                return Ok(message);
             }
         }
+    }
+
+    async fn read_packet(
+        &mut self,
+        expected_id: Option<u8>,
+    ) -> Result<(PacketHeader, Vec<u8>), Error> {
+        let mut bytes = [0; PACKET_HEADER_LEN];
+        self.read_exact(&mut bytes).await?;
+        let header = PacketHeader::decode(&bytes).map_err(packet_error)?;
+        if header.packet_type != PacketType::TABULAR_RESULT {
+            return Err(Error::Protocol(format!(
+                "expected a SQL Server tabular result, got packet type 0x{:02x}",
+                header.packet_type.code()
+            )));
+        }
+        if let Some(expected) = expected_id {
+            if header.packet_id != expected {
+                return Err(Error::Protocol(format!(
+                    "non-contiguous SQL Server packet id: expected {expected}, got {}",
+                    header.packet_id
+                )));
+            }
+        }
+        let len = usize::from(header.length);
+        if len > self.packet_size {
+            return Err(Error::Protocol(format!(
+                "SQL Server packet length {len} exceeds negotiated packet size {}",
+                self.packet_size
+            )));
+        }
+
+        let mut payload = vec![0; len - PACKET_HEADER_LEN];
+        self.read_exact(&mut payload).await?;
+        Ok((header, payload))
     }
 
     async fn read_exact(&mut self, bytes: &mut [u8]) -> Result<(), Error> {
@@ -685,12 +656,6 @@ fn tds_packet_slice(bytes: &[u8], offset: usize) -> Result<&[u8], Error> {
     bytes.get(offset..packet_end).ok_or_else(|| {
         Error::Protocol("SQL Server outbound packet buffer ended inside a packet".to_owned())
     })
-}
-
-#[derive(Debug)]
-struct WireMessage {
-    packet_type: PacketType,
-    payload: Vec<u8>,
 }
 
 fn negotiate_encryption(requested: Encrypt, server: Encrypt) -> std::result::Result<bool, Error> {
