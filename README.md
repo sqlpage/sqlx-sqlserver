@@ -10,7 +10,7 @@ to crates.io and is not wired into the `sqlx` facade crate, so examples use
 
 ```toml
 [dependencies]
-sqlx-sqlserver = "0.0.3"
+sqlx-sqlserver = "0.0.5"
 sqlx-core = "=0.9.0"
 tokio = { version = "1", features = ["macros", "rt"] }
 ```
@@ -38,6 +38,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 ```
+
+Use `fetch` to read rows as SQL Server sends them. Dropping the stream between
+rows leaves the connection available for reuse. Before sending the next query,
+the driver drains the rest of the batch and applies its transaction changes.
+`fetch_one` and `fetch_optional` read to the end of the batch so they can report
+an error that follows the first row.
 
 ## Any Driver
 
