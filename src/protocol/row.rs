@@ -1,46 +1,55 @@
 use bytes::Bytes;
 use sqlx_core::column::Column;
-use sqlx_core::Error;
 use std::sync::Arc;
 
-use super::read::take;
+use super::read::{take, ReadError};
+use super::type_info::ValueLength;
 use crate::{MssqlColumn, MssqlRow, MssqlValue};
 
 #[derive(Debug)]
-pub(crate) struct Row;
+pub(crate) struct Row {
+    nulls: Vec<u8>,
+    values: Vec<MssqlValue>,
+    length: Option<ValueLength>,
+}
 
 impl Row {
     pub(crate) fn get(
-        payload: &Bytes,
         input: &mut &[u8],
         nullable: bool,
-        columns: Arc<[MssqlColumn]>,
-    ) -> Result<MssqlRow, Error> {
-        let mut values = Vec::with_capacity(columns.len());
+        columns: usize,
+    ) -> Result<Self, ReadError> {
         let nulls = if nullable {
-            take(input, columns.len().div_ceil(8))?
+            take(input, columns.div_ceil(8))?.to_vec()
         } else {
-            &[][..]
+            Vec::new()
         };
+        Ok(Self {
+            nulls,
+            values: Vec::with_capacity(columns),
+            length: None,
+        })
+    }
 
-        for (index, column) in columns.iter().enumerate() {
-            let type_info = column.type_info();
-
-            let value = if nullable && (nulls[index / 8] & (1 << (index % 8))) != 0 {
-                MssqlValue::null(type_info.clone())
+    pub(crate) fn read(
+        &mut self,
+        input: &mut Bytes,
+        columns: &Arc<[MssqlColumn]>,
+    ) -> Result<MssqlRow, ReadError> {
+        for (index, column) in columns.iter().enumerate().skip(self.values.len()) {
+            let ty = column.type_info();
+            let value = if !self.nulls.is_empty() && self.nulls[index / 8] & (1 << (index % 8)) != 0
+            {
+                None
             } else {
-                let protocol_type_info = type_info.protocol_type_info().ok_or_else(|| {
-                    Error::Protocol(format!("missing protocol type info for {type_info}"))
-                })?;
-                let data = protocol_type_info
-                    .get_value(payload, input)
-                    .map_err(|error| Error::Protocol(error.to_string()))?;
-                MssqlValue::new(type_info.clone(), data)
+                let metadata = ty.protocol_type_info().ok_or(ReadError::MissingTypeInfo)?;
+                ValueLength::read(&mut self.length, input, metadata)?
             };
-
-            values.push(value);
+            self.values.push(MssqlValue::new(ty.clone(), value));
         }
-
-        Ok(MssqlRow::new_shared(columns, values))
+        Ok(MssqlRow::new_shared(
+            Arc::clone(columns),
+            std::mem::take(&mut self.values),
+        ))
     }
 }

@@ -1,6 +1,4 @@
-use sqlx_core::Error;
-
-use super::read::{read_u16_le, read_u64_le};
+use super::read::{read_u16_le, read_u64_le, ReadError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Done {
@@ -11,7 +9,7 @@ pub(crate) struct Done {
 }
 
 impl Done {
-    pub(crate) fn get(input: &mut &[u8]) -> Result<Self, Error> {
+    pub(crate) fn get(input: &mut &[u8]) -> Result<Self, ReadError> {
         Ok(Self {
             status: Status::from_bits_truncate(read_u16_le(input)?),
             cursor_command: read_u16_le(input)?,

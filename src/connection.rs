@@ -760,7 +760,7 @@ impl Stream for QueryEventStream<'_> {
 
     fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            match self.events.next() {
+            match self.events.next_in_message() {
                 Ok(Some(QueryEvent::Columns(_))) | Ok(Some(QueryEvent::ReturnValue(_))) => {}
                 Ok(Some(QueryEvent::EnvChange(env_change))) => {
                     self.conn.apply_env_change(&env_change);

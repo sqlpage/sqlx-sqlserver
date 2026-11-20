@@ -1,14 +1,14 @@
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use sqlx_core::Error;
 use std::sync::Arc;
 
 use super::col_meta_data::ColMetaData;
 use super::done::{Done, Status};
 use super::packet::{encode_message, PacketFrameError, PacketType};
-use super::read::{read_len_prefixed, read_u32_le, read_u8};
+use super::read::{read_len_prefixed, read_u32_le, read_u8, ReadError};
 use super::return_value::ReturnValue;
 use super::row::Row;
-use super::token::{parse_env_change, parse_server_error, EnvChange, TokenParseError};
+use super::token::{parse_env_change, parse_server_error, EnvChange};
 use crate::{error::server_error, MssqlColumn, MssqlQueryResult, MssqlRow, MssqlValue};
 
 const TOKEN_COL_METADATA: u8 = 0x81;
@@ -43,92 +43,132 @@ pub(crate) enum QueryEvent {
 }
 
 #[derive(Debug)]
+enum PartialToken {
+    Columns(ColMetaData),
+    Row(Row),
+    ReturnValue(ReturnValue),
+}
+
+#[derive(Debug, Default)]
 pub(crate) struct QueryEvents {
     payload: Bytes,
-    offset: usize,
+    partial: Option<PartialToken>,
     columns: Arc<[MssqlColumn]>,
 }
 
 impl QueryEvents {
     pub(crate) fn new(payload: impl Into<Bytes>) -> Self {
-        Self {
-            payload: payload.into(),
-            offset: 0,
-            columns: Arc::from(Vec::new()),
+        let mut events = Self::default();
+        events.push_packet(payload.into());
+        events
+    }
+
+    pub(crate) fn push_packet(&mut self, packet: Bytes) {
+        if self.payload.is_empty() {
+            self.payload = packet;
+        } else {
+            // Only an incomplete field crosses this packet boundary.
+            let mut joined = BytesMut::from(std::mem::take(&mut self.payload));
+            joined.extend_from_slice(&packet);
+            self.payload = joined.freeze();
         }
     }
 
-    pub(crate) fn next(&mut self) -> Result<Option<QueryEvent>, Error> {
-        let result = self.parse_next();
+    pub(crate) fn finish(&self) -> Result<(), Error> {
+        if self.partial.is_some() || !self.payload.is_empty() {
+            return Err(Error::Protocol(ReadError::UnexpectedEof.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Decode a buffered, complete message and stop after its first error.
+    pub(crate) fn next_in_message(&mut self) -> Result<Option<QueryEvent>, Error> {
+        let result = match self.next() {
+            Ok(None) => self.finish().map(|()| None),
+            other => other,
+        };
         if result.is_err() {
-            self.offset = self.payload.len();
+            *self = Self::default();
         }
         result
     }
 
-    fn parse_next(&mut self) -> Result<Option<QueryEvent>, Error> {
+    pub(crate) fn next(&mut self) -> Result<Option<QueryEvent>, Error> {
         loop {
-            if self.offset >= self.payload.len() {
-                return Ok(None);
-            }
-
-            let mut input = &self.payload[self.offset..];
-            let token = read_u8(&mut input)?;
-            let event = match token {
-                TOKEN_COL_METADATA => {
-                    self.columns = ColMetaData::get(&mut input)?.into();
-                    Some(QueryEvent::Columns(self.columns.to_vec()))
-                }
-                TOKEN_ROW => Some(QueryEvent::Row(Row::get(
-                    &self.payload,
-                    &mut input,
-                    false,
-                    Arc::clone(&self.columns),
-                )?)),
-                TOKEN_NBCROW => Some(QueryEvent::Row(Row::get(
-                    &self.payload,
-                    &mut input,
-                    true,
-                    Arc::clone(&self.columns),
-                )?)),
-                TOKEN_RETURN_VALUE => Some(QueryEvent::ReturnValue(
-                    ReturnValue::get(&self.payload, &mut input)?.into_value(),
-                )),
-                TOKEN_RETURN_STATUS => {
-                    let _ = read_u32_le(&mut input)?;
-                    None
-                }
-                TOKEN_DONE | TOKEN_DONEPROC | TOKEN_DONEINPROC => {
-                    let done = Done::get(&mut input)?;
-                    done.status
-                        .contains(Status::DONE_COUNT)
-                        .then(|| QueryEvent::Result(MssqlQueryResult::new(done.affected_rows)))
-                }
-                TOKEN_ERROR => {
-                    let error = parse_server_error(read_len_prefixed(&mut input)?)
-                        .map_err(token_parse_error)?;
-                    return Err(server_error(error));
-                }
-                TOKEN_ENVCHANGE => Some(QueryEvent::EnvChange(
-                    parse_env_change(read_len_prefixed(&mut input)?).map_err(token_parse_error)?,
-                )),
-                TOKEN_INFO | TOKEN_ORDER => {
-                    let _ = read_len_prefixed(&mut input)?;
-                    None
-                }
-                other => {
-                    return Err(Error::Protocol(format!(
-                        "unsupported SQL Server query token 0x{other:02x}"
-                    )));
-                }
-            };
-
-            self.offset = self.payload.len() - input.len();
-
-            if let Some(event) = event {
-                return Ok(Some(event));
+            match self.read_token() {
+                Ok(None) => continue,
+                Ok(Some(event)) => return Ok(Some(event)),
+                Err(ReadError::UnexpectedEof) => return Ok(None),
+                Err(ReadError::Database(error)) => return Err(server_error(error)),
+                Err(error) => return Err(Error::Protocol(error.to_string())),
             }
         }
+    }
+
+    fn read_token(&mut self) -> Result<Option<QueryEvent>, ReadError> {
+        if let Some(token) = &mut self.partial {
+            let event = match token {
+                PartialToken::Columns(metadata) => {
+                    let columns = metadata.read(&mut self.payload)?;
+                    self.columns = columns.clone().into();
+                    QueryEvent::Columns(columns)
+                }
+                PartialToken::Row(row) => {
+                    QueryEvent::Row(row.read(&mut self.payload, &self.columns)?)
+                }
+                PartialToken::ReturnValue(value) => {
+                    QueryEvent::ReturnValue(value.read(&mut self.payload)?)
+                }
+            };
+            self.partial = None;
+            return Ok(Some(event));
+        }
+
+        let mut input = self.payload.as_ref();
+        let token = read_u8(&mut input)?;
+        let event = match token {
+            TOKEN_COL_METADATA => {
+                self.partial = Some(PartialToken::Columns(ColMetaData::get(&mut input)?));
+                None
+            }
+            TOKEN_ROW | TOKEN_NBCROW => {
+                self.partial = Some(PartialToken::Row(Row::get(
+                    &mut input,
+                    token == TOKEN_NBCROW,
+                    self.columns.len(),
+                )?));
+                None
+            }
+            TOKEN_RETURN_VALUE => {
+                self.partial = Some(PartialToken::ReturnValue(ReturnValue::get(&mut input)?));
+                None
+            }
+            TOKEN_RETURN_STATUS => {
+                let _ = read_u32_le(&mut input)?;
+                None
+            }
+            TOKEN_DONE | TOKEN_DONEPROC | TOKEN_DONEINPROC => {
+                let done = Done::get(&mut input)?;
+                done.status
+                    .contains(Status::DONE_COUNT)
+                    .then(|| QueryEvent::Result(MssqlQueryResult::new(done.affected_rows)))
+            }
+            TOKEN_ERROR => {
+                let error = parse_server_error(read_len_prefixed(&mut input)?)?;
+                self.payload.advance(self.payload.len() - input.len());
+                return Err(ReadError::Database(error));
+            }
+            TOKEN_ENVCHANGE => Some(QueryEvent::EnvChange(parse_env_change(read_len_prefixed(
+                &mut input,
+            )?)?)),
+            TOKEN_INFO | TOKEN_ORDER => {
+                let _ = read_len_prefixed(&mut input)?;
+                None
+            }
+            other => return Err(ReadError::UnsupportedToken(other)),
+        };
+        self.payload.advance(self.payload.len() - input.len());
+        Ok(event)
     }
 }
 
@@ -154,7 +194,7 @@ pub(crate) fn parse_query_response(input: &[u8]) -> Result<QueryOutput, Error> {
     let mut env_changes = Vec::new();
     let mut rows_affected = 0;
 
-    while let Some(event) = events.next()? {
+    while let Some(event) = events.next_in_message()? {
         match event {
             QueryEvent::Columns(new_columns) => columns = new_columns,
             QueryEvent::Row(_) => {}
@@ -178,10 +218,6 @@ pub(crate) fn write_all_headers(out: &mut Vec<u8>, transaction_descriptor: u64) 
     out.extend_from_slice(&2_u16.to_le_bytes());
     out.extend_from_slice(&transaction_descriptor.to_le_bytes());
     out.extend_from_slice(&1_u32.to_le_bytes());
-}
-
-fn token_parse_error(error: TokenParseError) -> Error {
-    Error::Protocol(error.to_string())
 }
 
 #[cfg(test)]
@@ -325,8 +361,98 @@ mod tests {
         .concat();
         let mut events = QueryEvents::new(response);
 
-        assert!(matches!(events.next(), Err(Error::Database(_))));
+        assert!(matches!(events.next_in_message(), Err(Error::Database(_))));
+        assert!(events.next_in_message().unwrap().is_none());
+    }
+
+    #[test]
+    fn reads_columns_rows_and_chunked_values_across_packet_boundaries() {
+        use crate::protocol::type_info::DataType;
+
+        // One fixed integer followed by a varbinary(max) value of unknown length.
+        let mut batch = col_metadata_int("id");
+        batch[1] = 2;
+        batch.extend_from_slice(&[0; 6]);
+        batch.extend_from_slice(&[DataType::BigVarBinary as u8, 0xff, 0xff]);
+        push_b_varchar(&mut batch, "blob");
+        batch.extend_from_slice(&[TOKEN_NBCROW, 0]);
+        batch.extend_from_slice(&42_i32.to_le_bytes());
+        batch.extend_from_slice(&(u64::MAX - 1).to_le_bytes());
+        let blob = (0..240).cycle().take(8192).collect::<Vec<u8>>();
+        for part in blob.chunks(67) {
+            batch.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            batch.extend_from_slice(part);
+        }
+        batch.extend_from_slice(&0_u32.to_le_bytes());
+        batch.extend_from_slice(&done(0x10, 0, 1));
+
+        let mut events = QueryEvents::default();
+        let mut rows = Vec::new();
+        let mut results = Vec::new();
+        for packet in batch.chunks(3) {
+            events.push_packet(Bytes::copy_from_slice(packet));
+            while let Some(event) = events.next().unwrap() {
+                match event {
+                    QueryEvent::Row(row) => rows.push(row),
+                    QueryEvent::Result(result) => results.push(result.rows_affected()),
+                    _ => (),
+                }
+            }
+            // Finished PLP chunks have already been consumed.
+            assert!(events.payload.len() < 4 + 67);
+        }
+        events.finish().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<i32, _>("id").unwrap(), 42);
+        assert_eq!(rows[0].try_get::<&[u8], _>("blob").unwrap(), blob);
+        assert_eq!(results, [1]);
+    }
+
+    #[test]
+    fn reports_incomplete_tokens_at_end_of_message() {
+        let int_column = col_metadata_int("value");
+        for partial in [
+            &int_column[..4],
+            &[TOKEN_DONE, 0][..],
+            &[TOKEN_RETURN_VALUE][..],
+        ] {
+            let mut events = QueryEvents::new(partial.to_vec());
+            assert!(events.next().unwrap().is_none());
+            assert!(events.finish().is_err());
+        }
+        let mut events = QueryEvents::new([int_column, vec![TOKEN_ROW]].concat());
+        assert!(matches!(
+            events.next().unwrap(),
+            Some(QueryEvent::Columns(_))
+        ));
         assert!(events.next().unwrap().is_none());
+        assert!(events.finish().is_err());
+    }
+
+    #[test]
+    fn can_drain_state_changes_after_a_server_error() {
+        let mut events = QueryEvents::new(
+            [
+                error(208, 1, 16, "Invalid object name", "dbhost", "", 3),
+                env_change(8, &[8, 8, 7, 6, 5, 4, 3, 2, 1]),
+            ]
+            .concat(),
+        );
+        assert!(matches!(events.next(), Err(Error::Database(_))));
+        assert!(matches!(
+            events.next().unwrap(),
+            Some(QueryEvent::EnvChange(EnvChange::BeginTransaction(
+                0x0102_0304_0506_0708
+            )))
+        ));
+        assert!(events.next().unwrap().is_none());
+        events.finish().unwrap();
+    }
+
+    #[test]
+    fn malformed_length_prefixed_token_fails_immediately() {
+        let mut events = QueryEvents::new(vec![TOKEN_ERROR, 1, 0, 0]);
+        assert!(matches!(events.next(), Err(Error::Protocol(_))));
     }
 
     fn col_metadata_int(name: &str) -> Vec<u8> {
@@ -449,7 +575,7 @@ mod tests {
         let mut events = QueryEvents::new(response.to_vec());
         let mut rows = Vec::new();
 
-        while let Some(event) = events.next().unwrap() {
+        while let Some(event) = events.next_in_message().unwrap() {
             if let QueryEvent::Row(row) = event {
                 rows.push(row);
             }

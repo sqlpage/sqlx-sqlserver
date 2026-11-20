@@ -1,6 +1,7 @@
 use std::fmt::Write;
 
-use bytes::Bytes;
+use super::read::{consume, read_u16_le, read_u32_le, read_u64_le, read_u8, take, ReadError};
+use bytes::{Buf, Bytes};
 use sqlx_core::encode::{Encode, IsNull};
 use sqlx_core::error::BoxDynError;
 
@@ -119,7 +120,7 @@ impl TypeInfo {
     }
 
     // reads a TYPE_INFO from the buffer
-    pub(crate) fn get(input: &mut &[u8]) -> Result<Self, TypeInfoError> {
+    pub(crate) fn get(input: &mut &[u8]) -> Result<Self, ReadError> {
         let ty = DataType::get(input)?;
 
         Ok(match ty {
@@ -147,7 +148,7 @@ impl TypeInfo {
                     3..=4 => 4,
                     5..=7 => 5,
                     scale => {
-                        return Err(TypeInfoError::InvalidScale { ty, scale });
+                        return Err(ReadError::InvalidScale { ty, scale });
                     }
                 };
 
@@ -218,7 +219,7 @@ impl TypeInfo {
             | DataType::Image
             | DataType::NText
             | DataType::Variant => {
-                return Err(TypeInfoError::UnsupportedDataType(ty));
+                return Err(ReadError::UnsupportedDataType(ty));
             }
         })
     }
@@ -315,13 +316,9 @@ impl TypeInfo {
         )
     }
 
-    pub(crate) fn get_value(
-        &self,
-        payload: &Bytes,
-        input: &mut &[u8],
-    ) -> Result<Option<Bytes>, TypeInfoError> {
+    fn value_length(&self, input: &mut &[u8]) -> Result<ValueLength, ReadError> {
         Ok(match self.ty {
-            DataType::Null => None,
+            DataType::Null => ValueLength::Null,
 
             DataType::TinyInt
             | DataType::Bit
@@ -333,7 +330,7 @@ impl TypeInfo {
             | DataType::DateTime
             | DataType::Float
             | DataType::SmallMoney
-            | DataType::BigInt => Some(take_shared(payload, input, self.size as usize)?),
+            | DataType::BigInt => ValueLength::Bytes(self.size as usize),
 
             DataType::Guid
             | DataType::IntN
@@ -352,18 +349,18 @@ impl TypeInfo {
                 let size = read_u8(input)?;
 
                 if size == 0 || size == 0xff {
-                    None
+                    ValueLength::Null
                 } else {
-                    Some(take_shared(payload, input, usize::from(size))?)
+                    ValueLength::Bytes(usize::from(size))
                 }
             }
 
             DataType::Char | DataType::VarChar | DataType::Binary | DataType::VarBinary => {
                 let size = read_u8(input)?;
                 if size == 0xff {
-                    None
+                    ValueLength::Null
                 } else {
-                    Some(take_shared(payload, input, usize::from(size))?)
+                    ValueLength::Bytes(usize::from(size))
                 }
             }
 
@@ -376,13 +373,19 @@ impl TypeInfo {
             | DataType::Xml
             | DataType::UserDefined => {
                 if self.size == 0xffff {
-                    self.get_big_blob(input)?
+                    match read_u64_le(input)? {
+                        PLP_NULL => ValueLength::Null,
+                        declared => ValueLength::Plp {
+                            declared,
+                            data: Vec::new(),
+                        },
+                    }
                 } else {
                     let size = read_u16_le(input)?;
                     if size == 0xffff {
-                        None
+                        ValueLength::Null
                     } else {
-                        Some(take_shared(payload, input, usize::from(size))?)
+                        ValueLength::Bytes(usize::from(size))
                     }
                 }
             }
@@ -391,39 +394,12 @@ impl TypeInfo {
                 let size = read_u32_le(input)?;
 
                 if size == 0xffff_ffff {
-                    None
+                    ValueLength::Null
                 } else {
-                    Some(take_shared(payload, input, usize::try_from(size).unwrap())?)
+                    ValueLength::Bytes(size as usize)
                 }
             }
         })
-    }
-
-    pub(crate) fn get_big_blob(&self, input: &mut &[u8]) -> Result<Option<Bytes>, TypeInfoError> {
-        let len = read_u64_le(input)?;
-        if len == PLP_NULL {
-            return Ok(None);
-        }
-
-        let mut data = Vec::new();
-        loop {
-            let chunk_size = read_u32_le(input)? as usize;
-
-            if chunk_size == 0 {
-                break;
-            }
-
-            data.extend_from_slice(take(input, chunk_size)?);
-        }
-
-        if len != PLP_UNKNOWN_LENGTH && len != data.len() as u64 {
-            return Err(TypeInfoError::InvalidPlpLength {
-                declared: len,
-                actual: data.len(),
-            });
-        }
-
-        Ok(Some(Bytes::from(data)))
     }
 
     pub(crate) fn put_value<'q, T: Encode<'q, Mssql>>(
@@ -751,21 +727,60 @@ impl TypeInfo {
     }
 }
 
-fn take_shared(payload: &Bytes, input: &mut &[u8], len: usize) -> Result<Bytes, TypeInfoError> {
-    let start = payload
-        .len()
-        .checked_sub(input.len())
-        .ok_or(TypeInfoError::UnexpectedEof)?;
-    take(input, len)?;
-    let end = payload
-        .len()
-        .checked_sub(input.len())
-        .ok_or(TypeInfoError::UnexpectedEof)?;
-    Ok(payload.slice(start..end))
+/// The length prefix is read once. A partially length-prefixed (PLP) value
+/// keeps its completed chunks while the next TDS packet arrives.
+#[derive(Debug)]
+pub(crate) enum ValueLength {
+    Null,
+    Bytes(usize),
+    Plp { declared: u64, data: Vec<u8> },
+}
+
+impl ValueLength {
+    pub(crate) fn read(
+        partial: &mut Option<Self>,
+        input: &mut Bytes,
+        type_info: &TypeInfo,
+    ) -> Result<Option<Bytes>, ReadError> {
+        let length = match partial {
+            Some(length) => length,
+            None => partial.insert(consume(input, |src| type_info.value_length(src))?),
+        };
+        let value = match length {
+            Self::Null => None,
+            Self::Bytes(len) => {
+                if input.len() < *len {
+                    return Err(ReadError::UnexpectedEof);
+                }
+                Some(input.split_to(*len))
+            }
+            Self::Plp { declared, data } => {
+                loop {
+                    let mut chunk = input.as_ref();
+                    let size = read_u32_le(&mut chunk)? as usize;
+                    let bytes = take(&mut chunk, size)?;
+                    data.extend_from_slice(bytes);
+                    input.advance(4 + size);
+                    if size == 0 {
+                        break;
+                    }
+                }
+                if *declared != PLP_UNKNOWN_LENGTH && *declared != data.len() as u64 {
+                    return Err(ReadError::InvalidPlpLength {
+                        declared: *declared,
+                        actual: data.len(),
+                    });
+                }
+                Some(Bytes::from(std::mem::take(data)))
+            }
+        };
+        *partial = None;
+        Ok(value)
+    }
 }
 
 impl DataType {
-    pub(crate) fn get(input: &mut &[u8]) -> Result<Self, TypeInfoError> {
+    pub(crate) fn get(input: &mut &[u8]) -> Result<Self, ReadError> {
         Ok(match read_u8(input)? {
             0x1f => DataType::Null,
             0x30 => DataType::TinyInt,
@@ -809,7 +824,7 @@ impl DataType {
             0x22 => DataType::Image,
             0x63 => DataType::NText,
             0x62 => DataType::Variant,
-            ty => return Err(TypeInfoError::UnknownDataType(ty)),
+            ty => return Err(ReadError::UnknownDataType(ty)),
         })
     }
 }
@@ -877,7 +892,7 @@ impl Collation {
         }
     }
 
-    pub(crate) fn get(input: &mut &[u8]) -> Result<Collation, TypeInfoError> {
+    pub(crate) fn get(input: &mut &[u8]) -> Result<Collation, ReadError> {
         let locale_sort_version = read_u32_le(input)?;
         let locale = locale_sort_version & 0xfffff;
         let flags = CollationFlags::from_bits_truncate(((locale_sort_version >> 20) & 0xff) as u8);
@@ -899,48 +914,6 @@ impl Collation {
         out.extend_from_slice(&locale_sort_version.to_le_bytes());
         out.push(self.sort);
     }
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(crate) enum TypeInfoError {
-    #[error("TDS TYPE_INFO ended unexpectedly")]
-    UnexpectedEof,
-    #[error("unknown TDS data type 0x{0:02x}")]
-    UnknownDataType(u8),
-    #[error("unsupported TDS data type {0:?}")]
-    UnsupportedDataType(DataType),
-    #[error("invalid scale {scale} for type {ty:?}")]
-    InvalidScale { ty: DataType, scale: u8 },
-    #[error("TDS value declared {declared} bytes but contained {actual} bytes")]
-    InvalidPlpLength { declared: u64, actual: usize },
-}
-
-fn read_u8(input: &mut &[u8]) -> Result<u8, TypeInfoError> {
-    let bytes = take(input, 1)?;
-    Ok(bytes[0])
-}
-
-fn read_u16_le(input: &mut &[u8]) -> Result<u16, TypeInfoError> {
-    let bytes = take(input, 2)?;
-    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
-}
-
-fn read_u32_le(input: &mut &[u8]) -> Result<u32, TypeInfoError> {
-    let bytes = take(input, 4)?;
-    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
-fn read_u64_le(input: &mut &[u8]) -> Result<u64, TypeInfoError> {
-    let bytes = take(input, 8)?;
-    Ok(u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ]))
-}
-
-fn take<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8], TypeInfoError> {
-    let bytes = input.get(..len).ok_or(TypeInfoError::UnexpectedEof)?;
-    *input = &input[len..];
-    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -971,14 +944,14 @@ mod tests {
             0,
             0,
         ]);
-        let mut input = payload.as_ref();
+        let mut input = payload;
 
-        let type_info = TypeInfo::get(&mut input).unwrap();
+        let type_info = consume(&mut input, TypeInfo::get).unwrap();
 
         assert_eq!(type_info, TypeInfo::new(DataType::IntN, 4));
         assert_eq!(
             Some(Bytes::from_static(&[1, 0, 0, 0])),
-            type_info.get_value(&payload, &mut input).unwrap()
+            ValueLength::read(&mut None, &mut input, &type_info).unwrap()
         );
     }
 
@@ -1026,11 +999,10 @@ mod tests {
         assert_eq!(&[4, 0, 0, 0], &out[8..12]);
         assert_eq!(&[0, 0, 0, 0], &out[out.len() - 4..]);
 
-        let payload = Bytes::copy_from_slice(&out);
-        let mut input = payload.as_ref();
+        let mut input = Bytes::from(out);
         assert_eq!(
             Some(Bytes::from_static(&[b'h', 0, b'i', 0])),
-            type_info.get_value(&payload, &mut input).unwrap()
+            ValueLength::read(&mut None, &mut input, &type_info).unwrap()
         );
         assert!(input.is_empty());
     }
@@ -1040,11 +1012,11 @@ mod tests {
         let type_info = TypeInfo::new(DataType::BigVarBinary, 0xffff);
         let payload = Bytes::from_static(&[2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, b'a', 0, 0, 0, 0]);
         assert_eq!(
-            Err(TypeInfoError::InvalidPlpLength {
+            Err(ReadError::InvalidPlpLength {
                 declared: 2,
                 actual: 1,
             }),
-            type_info.get_value(&payload, &mut payload.as_ref()),
+            ValueLength::read(&mut None, &mut payload.clone(), &type_info),
         );
     }
 
@@ -1073,12 +1045,10 @@ mod tests {
         assert_eq!(vec![PLP_CHUNK_SIZE, PLP_CHUNK_SIZE, 2], chunk_sizes);
         assert!(input.is_empty());
 
-        let payload = Bytes::copy_from_slice(&out);
-        let mut input = payload.as_ref();
+        let mut input = Bytes::from(out);
         assert_eq!(
             expected_len,
-            type_info
-                .get_value(&payload, &mut input)
+            ValueLength::read(&mut None, &mut input, &type_info)
                 .unwrap()
                 .unwrap()
                 .len()
@@ -1097,9 +1067,11 @@ mod tests {
 
         assert_eq!(PLP_NULL.to_le_bytes(), out.as_slice());
 
-        let payload = Bytes::copy_from_slice(&out);
-        let mut input = payload.as_ref();
-        assert_eq!(None, type_info.get_value(&payload, &mut input).unwrap());
+        let mut input = Bytes::from(out);
+        assert_eq!(
+            None,
+            ValueLength::read(&mut None, &mut input, &type_info).unwrap()
+        );
         assert!(input.is_empty());
     }
 

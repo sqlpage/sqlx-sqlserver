@@ -1,57 +1,34 @@
 use bytes::Bytes;
-use sqlx_core::Error;
 
-use super::col_meta_data::Flags;
-use super::read::{read_b_varchar, read_u16_le, read_u32_le, read_u8};
-use super::type_info::TypeInfo;
+use super::read::{read_b_varchar, read_u16_le, read_u32_le, read_u8, ReadError};
+use super::type_info::{TypeInfo, ValueLength};
 use crate::{MssqlTypeInfo, MssqlValue};
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct ReturnValue {
-    param_ordinal: u16,
-    param_name: String,
-    status: ReturnValueStatus,
-    user_type: u32,
-    flags: Flags,
-    pub(crate) type_info: TypeInfo,
-    pub(crate) value: Option<Bytes>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ReturnValueStatus(u8);
-
-impl ReturnValueStatus {
-    pub(crate) const fn from_bits_truncate(bits: u8) -> Self {
-        Self(bits & 0x03)
-    }
+    type_info: TypeInfo,
+    length: Option<ValueLength>,
 }
 
 impl ReturnValue {
-    pub(crate) fn get(payload: &Bytes, input: &mut &[u8]) -> Result<Self, Error> {
-        let param_ordinal = read_u16_le(input)?;
-        let param_name = read_b_varchar(input)?;
-        let status = ReturnValueStatus::from_bits_truncate(read_u8(input)?);
-        let user_type = read_u32_le(input)?;
-        let flags = Flags::from_bits_truncate(read_u16_le(input)?);
-        let type_info = TypeInfo::get(input).map_err(|error| Error::Protocol(error.to_string()))?;
-        let value = type_info
-            .get_value(payload, input)
-            .map_err(|error| Error::Protocol(error.to_string()))?;
-
+    pub(crate) fn get(input: &mut &[u8]) -> Result<Self, ReadError> {
+        let _ordinal = read_u16_le(input)?;
+        let _name = read_b_varchar(input)?;
+        let _status = read_u8(input)?;
+        let _user_type = read_u32_le(input)?;
+        let _flags = read_u16_le(input)?;
         Ok(Self {
-            param_ordinal,
-            param_name,
-            status,
-            user_type,
-            flags,
-            type_info,
-            value,
+            type_info: TypeInfo::get(input)?,
+            length: None,
         })
     }
 
-    pub(crate) fn into_value(self) -> MssqlValue {
-        MssqlValue::new(MssqlTypeInfo::from_protocol(&self.type_info), self.value)
+    pub(crate) fn read(&mut self, input: &mut Bytes) -> Result<MssqlValue, ReadError> {
+        let value = ValueLength::read(&mut self.length, input, &self.type_info)?;
+        Ok(MssqlValue::new(
+            MssqlTypeInfo::from_protocol(&self.type_info),
+            value,
+        ))
     }
 }
 
@@ -59,6 +36,9 @@ impl ReturnValue {
 mod tests {
     use super::*;
     use crate::protocol::type_info::DataType;
+    use crate::Mssql;
+    use sqlx_core::decode::Decode;
+    use sqlx_core::value::Value;
 
     #[test]
     fn parses_return_value() {
@@ -81,10 +61,14 @@ mod tests {
             0,
             0,
         ]);
-        let mut input = payload.as_ref();
+        let mut input = payload;
 
-        let return_value = ReturnValue::get(&payload, &mut input).unwrap();
+        let mut field = super::super::read::consume(&mut input, ReturnValue::get).unwrap();
+        let return_value = field.read(&mut input).unwrap();
 
-        assert_eq!(return_value.value, Some(Bytes::from_static(&[1, 0, 0, 0])));
+        assert_eq!(
+            <i32 as Decode<Mssql>>::decode(return_value.as_ref()).unwrap(),
+            1
+        );
     }
 }

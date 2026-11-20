@@ -1,65 +1,45 @@
-use sqlx_core::Error;
+use bytes::Bytes;
 
-use super::read::{read_b_varchar, read_u16_le, read_u32_le};
+use super::read::{consume, read_b_varchar, read_u16_le, read_u32_le, ReadError};
 use super::type_info::TypeInfo;
 use crate::{MssqlColumn, MssqlTypeInfo};
 
 #[derive(Debug)]
-pub(crate) struct ColMetaData;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ColumnData {
-    #[allow(dead_code)]
-    pub(crate) user_type: u32,
-    pub(crate) flags: Flags,
-    pub(crate) type_info: TypeInfo,
-    pub(crate) col_name: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Flags(u16);
-
-impl Flags {
-    pub(crate) const fn from_bits_truncate(bits: u16) -> Self {
-        Self(bits & 0x3f3f)
-    }
+pub(crate) struct ColMetaData {
+    count: usize,
+    columns: Vec<MssqlColumn>,
 }
 
 impl ColMetaData {
-    pub(crate) fn get(input: &mut &[u8]) -> Result<Vec<MssqlColumn>, Error> {
+    pub(crate) fn get(input: &mut &[u8]) -> Result<Self, ReadError> {
         let count = read_u16_le(input)?;
-        if count == 0xffff {
-            return Ok(Vec::new());
-        }
-
-        let mut columns = Vec::with_capacity(usize::from(count));
-
-        for ordinal in 0..usize::from(count) {
-            let column = ColumnData::get(input)?;
-            columns.push(MssqlColumn::new(
-                ordinal,
-                column.col_name,
-                MssqlTypeInfo::from_protocol(&column.type_info),
-            ));
-        }
-
-        Ok(columns)
-    }
-}
-
-impl ColumnData {
-    pub(crate) fn get(input: &mut &[u8]) -> Result<Self, Error> {
-        let user_type = read_u32_le(input)?;
-        let flags = Flags::from_bits_truncate(read_u16_le(input)?);
-        let type_info = TypeInfo::get(input).map_err(|error| Error::Protocol(error.to_string()))?;
-        let col_name = read_b_varchar(input)?;
-
+        let count = if count == 0xffff {
+            0
+        } else {
+            usize::from(count)
+        };
         Ok(Self {
-            user_type,
-            flags,
-            type_info,
-            col_name,
+            count,
+            columns: Vec::new(),
         })
+    }
+
+    pub(crate) fn read(&mut self, input: &mut Bytes) -> Result<Vec<MssqlColumn>, ReadError> {
+        while self.columns.len() < self.count {
+            let column = consume(input, |src| {
+                let _user_type = read_u32_le(src)?;
+                let _flags = read_u16_le(src)?;
+                let type_info = TypeInfo::get(src)?;
+                let name = read_b_varchar(src)?;
+                Ok(MssqlColumn::new(
+                    self.columns.len(),
+                    name,
+                    MssqlTypeInfo::from_protocol(&type_info),
+                ))
+            })?;
+            self.columns.push(column);
+        }
+        Ok(std::mem::take(&mut self.columns))
     }
 }
 
@@ -70,7 +50,7 @@ mod tests {
 
     #[test]
     fn parses_column_metadata() {
-        let mut input = &[
+        let input = &[
             1,
             0, // count
             0,
@@ -95,7 +75,9 @@ mod tests {
             0,
         ][..];
 
-        let columns = ColMetaData::get(&mut input).unwrap();
+        let mut bytes = Bytes::copy_from_slice(input);
+        let mut columns = consume(&mut bytes, ColMetaData::get).unwrap();
+        let columns = columns.read(&mut bytes).unwrap();
 
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].name(), "answer");
